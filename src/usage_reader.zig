@@ -100,67 +100,70 @@ pub const UsageReader = struct {
         entries: *std.ArrayList(UsageEntry),
         seen: *std.StringHashMap(void),
     ) !void {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) return;
-        const obj = root.object;
-
-        // Claude Code writes assistant turn entries with type = "assistant"
-        const type_val = obj.get("type") orelse return;
-        if (type_val != .string) return;
-        if (!std.mem.eql(u8, type_val.string, "assistant")) return;
-
-        // UUID for deduplication
-        const uuid_val = obj.get("uuid") orelse return;
-        if (uuid_val != .string) return;
-        if (seen.contains(uuid_val.string)) return;
-
-        const ts_val = obj.get("timestamp") orelse return;
-        if (ts_val != .string) return;
-        const ts_s = parseIso8601(ts_val.string) catch return;
-
-        const session_val = obj.get("sessionId") orelse return;
-        if (session_val != .string) return;
-
-        var cost: f64 = 0;
-        if (obj.get("costUSD")) |v| {
-            cost = switch (v) {
-                .float => |f| f,
-                .integer => |i| @floatFromInt(i),
-                else => 0,
-            };
+        const entry = try parseEntryFromLine(self.allocator, line) orelse return;
+        if (seen.contains(entry.uuid)) {
+            entry.deinit(self.allocator);
+            return;
         }
-
-        // Usage lives in message.usage
-        const msg_val = obj.get("message") orelse return;
-        if (msg_val != .object) return;
-        const msg = msg_val.object;
-
-        const usage_val = msg.get("usage") orelse return;
-        if (usage_val != .object) return;
-        const usage = usage_val.object;
-
-        const uuid_owned = try self.allocator.dupe(u8, uuid_val.string);
-        errdefer self.allocator.free(uuid_owned);
-
-        try seen.put(try self.allocator.dupe(u8, uuid_val.string), {});
-
-        try entries.append(.{
-            .timestamp_s = ts_s,
-            .session_id = try self.allocator.dupe(u8, session_val.string),
-            .uuid = uuid_owned,
-            .input_tokens = jsonUint(usage, "input_tokens"),
-            .output_tokens = jsonUint(usage, "output_tokens"),
-            .cache_create_tokens = jsonUint(usage, "cache_creation_input_tokens"),
-            .cache_read_tokens = jsonUint(usage, "cache_read_input_tokens"),
-            .cost_usd = cost,
-        });
+        try seen.put(try self.allocator.dupe(u8, entry.uuid), {});
+        try entries.append(entry);
     }
 };
+
+// Public: parse a single JSONL line into a UsageEntry. Returns null for non-assistant
+// lines or malformed input. Caller owns the returned entry and must call deinit.
+pub fn parseEntryFromLine(allocator: std.mem.Allocator, line: []const u8) !?UsageEntry {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+    const obj = root.object;
+
+    const type_val = obj.get("type") orelse return null;
+    if (type_val != .string) return null;
+    if (!std.mem.eql(u8, type_val.string, "assistant")) return null;
+
+    const uuid_val = obj.get("uuid") orelse return null;
+    if (uuid_val != .string) return null;
+
+    const ts_val = obj.get("timestamp") orelse return null;
+    if (ts_val != .string) return null;
+    const ts_s = parseIso8601(ts_val.string) catch return null;
+
+    const session_val = obj.get("sessionId") orelse return null;
+    if (session_val != .string) return null;
+
+    var cost: f64 = 0;
+    if (obj.get("costUSD")) |v| {
+        cost = switch (v) {
+            .float => |f| f,
+            .integer => |i| @floatFromInt(i),
+            else => 0,
+        };
+    }
+
+    const msg_val = obj.get("message") orelse return null;
+    if (msg_val != .object) return null;
+    const msg = msg_val.object;
+
+    const usage_val = msg.get("usage") orelse return null;
+    if (usage_val != .object) return null;
+    const usage = usage_val.object;
+
+    return .{
+        .timestamp_s = ts_s,
+        .session_id = try allocator.dupe(u8, session_val.string),
+        .uuid = try allocator.dupe(u8, uuid_val.string),
+        .input_tokens = jsonUint(usage, "input_tokens"),
+        .output_tokens = jsonUint(usage, "output_tokens"),
+        .cache_create_tokens = jsonUint(usage, "cache_creation_input_tokens"),
+        .cache_read_tokens = jsonUint(usage, "cache_read_input_tokens"),
+        .cost_usd = cost,
+    };
+}
 
 fn jsonUint(obj: std.json.ObjectMap, key: []const u8) u64 {
     const v = obj.get(key) orelse return 0;

@@ -1,0 +1,11 @@
+{
+  "_comment": "Dev machine config — save as ~/.config/ctm/agent.json",
+
+  "pi_host": "raspberrypi.local",
+  "pi_port": 7373,
+  "shared_secret": "change-me-to-something-random",
+  "poll_interval_ms": 500,
+
+  "_comment2": "Only needed if Claude Code isn't at the default ~/.claude/projects path",
+  "claude_data_path": null
+}

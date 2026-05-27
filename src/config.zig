@@ -30,6 +30,51 @@ pub const Plan = enum {
     }
 };
 
+// Config for the ctm-agent binary (runs on dev machine, ships data to Pi).
+pub const AgentConfig = struct {
+    pi_host: []const u8 = "raspberrypi.local",
+    pi_port: u16 = 7373,
+    shared_secret: []const u8 = "",
+    poll_interval_ms: u32 = 500,
+    claude_data_path: ?[]const u8 = null,
+
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !AgentConfig {
+        const file = std.fs.openFileAbsolute(path, .{}) catch return error.ConfigNotFound;
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 64 * 1024);
+        defer allocator.free(content);
+        const p = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer p.deinit();
+        if (p.value != .object) return error.InvalidConfig;
+        const obj = p.value.object;
+        var cfg = AgentConfig{};
+        if (obj.get("pi_host")) |v| if (v == .string) {
+            cfg.pi_host = try allocator.dupe(u8, v.string);
+        };
+        if (obj.get("pi_port")) |v| if (v == .integer) {
+            cfg.pi_port = @intCast(v.integer);
+        };
+        if (obj.get("shared_secret")) |v| if (v == .string) {
+            cfg.shared_secret = try allocator.dupe(u8, v.string);
+        };
+        if (obj.get("poll_interval_ms")) |v| if (v == .integer) {
+            cfg.poll_interval_ms = @intCast(v.integer);
+        };
+        if (obj.get("claude_data_path")) |v| if (v == .string) {
+            cfg.claude_data_path = try allocator.dupe(u8, v.string);
+        };
+        return cfg;
+    }
+};
+
+// Config for the HTTP ingest server embedded in ctm (runs on Pi).
+pub const IngestServerConfig = struct {
+    enabled: bool = false,
+    bind_host: []const u8 = "0.0.0.0",
+    bind_port: u16 = 7373,
+    shared_secret: []const u8 = "",
+};
+
 pub const EmailConfig = struct {
     enabled: bool = false,
     smtp_host: []const u8 = "smtp.gmail.com",
@@ -46,6 +91,7 @@ pub const Config = struct {
     notify_on_reset: bool = true,
     notify_threshold_percent: u8 = 80,
     email: EmailConfig = .{},
+    ingest_server: IngestServerConfig = .{},
     claude_data_path: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
 
@@ -86,6 +132,21 @@ pub const Config = struct {
         }
         if (obj.get("log_file")) |v| {
             if (v == .string) cfg.log_file = try allocator.dupe(u8, v.string);
+        }
+        if (obj.get("ingest_server")) |iv| {
+            if (iv == .object) {
+                const io = iv.object;
+                var isc = IngestServerConfig{};
+                if (io.get("enabled")) |v| if (v == .bool) { isc.enabled = v.bool; };
+                if (io.get("bind_host")) |v| if (v == .string) {
+                    isc.bind_host = try allocator.dupe(u8, v.string);
+                };
+                if (io.get("bind_port")) |v| if (v == .integer) { isc.bind_port = @intCast(v.integer); };
+                if (io.get("shared_secret")) |v| if (v == .string) {
+                    isc.shared_secret = try allocator.dupe(u8, v.string);
+                };
+                cfg.ingest_server = isc;
+            }
         }
         if (obj.get("email")) |email_val| {
             if (email_val == .object) {

@@ -1,20 +1,27 @@
 {
+  "_comment": "Pi config — save as ~/.config/ctm/config.json on the Raspberry Pi",
+
   "plan": "pro",
   "refresh_interval_seconds": 30,
   "notify_on_reset": true,
   "notify_threshold_percent": 80,
+
+  "ingest_server": {
+    "enabled": true,
+    "bind_host": "0.0.0.0",
+    "bind_port": 7373,
+    "shared_secret": "change-me-to-something-random"
+  },
+
+  "log_file": "/home/pi/.ctm.log",
 
   "email": {
     "enabled": true,
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
     "username": "you@gmail.com",
-    "password": "your-app-password",
+    "password": "your-gmail-app-password",
     "from": "you@gmail.com",
     "to": "notify@youremail.com"
-  },
-
-  "claude_data_path": null,
-
-  "log_file": "/var/log/ctm.log"
+  }
 }

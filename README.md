@@ -6,7 +6,11 @@ you the moment your 5-hour token window resets.
 
 Inspired by
 [Maciek-roboblog/Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor),
-re-implemented in Zig with email alerts and daemon mode added.
+re-implemented in Zig with email alerts, daemon mode, and remote Pi deployment added.
+
+> **Key difference from similar tools:** `ctm` is designed for a two-machine setup.
+> Your dev machine runs `ctm-agent`, which ships token data to a Raspberry Pi running
+> `ctm --daemon`. The Pi sends email alerts without needing Claude Code installed on it.
 
 ---
 
@@ -19,6 +23,24 @@ have to keep refreshing the terminal to see if you're back online.
 `ctm` runs as a tiny native daemon, reads the JSONL session files Claude Code
 already writes to `~/.claude/projects/`, and sends an email the moment your
 quota frees up.
+
+---
+
+## Architecture
+
+```
+[ Dev Machine (Mac/Linux) ]              [ Raspberry Pi Zero ]
+  Claude Code                              ctm --daemon
+  ~/.claude/projects/*.jsonl               (ingest_server.enabled = true)
+  ctm-agent  ──── HTTP POST ──────────►   :7373/ingest
+  (polls for new lines every 500ms)        │
+                                           ├─ email on reset
+                                           └─ email on threshold
+```
+
+`ctm-agent` uses `stat()` polling to detect new JSONL lines and ships only the
+new bytes — nothing is ever re-read. The Pi holds entries in memory and prunes
+anything older than 6h, keeping RSS well under 8 MB.
 
 ---
 
@@ -150,6 +172,76 @@ Example (`config.example.json`):
 
 > Limits are rough — Anthropic doesn't publish exact numbers. Adjust
 > `src/config.zig` if your account behaves differently.
+
+---
+
+## Two-machine setup (Pi Zero + dev machine)
+
+This is the primary deployment scenario. Claude Code runs on your dev machine;
+the Pi Zero runs `ctm --daemon` and sends emails.
+
+### 1. Pi Zero — install and configure `ctm`
+
+```bash
+# On the Pi
+git clone https://github.com/GageLawton/Claude-Token-Monitor
+cd Claude-Token-Monitor
+bash scripts/install.sh          # installs ctm to /usr/local/bin
+
+mkdir -p ~/.config/ctm
+cp config.example.json ~/.config/ctm/config.json
+# Edit: set your email, shared_secret, and ingest_server.enabled = true
+nano ~/.config/ctm/config.json
+```
+
+Start the daemon:
+
+```bash
+ctm --daemon
+# or via systemd (see below)
+```
+
+### 2. Dev machine — install and configure `ctm-agent`
+
+```bash
+# On your Mac/Linux dev machine
+zig build -Doptimize=ReleaseSafe
+sudo cp zig-out/bin/ctm-agent /usr/local/bin/
+
+mkdir -p ~/.config/ctm
+cp config.example.agent.json ~/.config/ctm/agent.json
+# Edit: set pi_host (raspberrypi.local or IP), and the same shared_secret
+nano ~/.config/ctm/agent.json
+```
+
+Run the agent (keep it running in the background):
+
+```bash
+ctm-agent &
+# or add to your shell profile / launchd / systemd user session
+```
+
+### 3. Verify
+
+```bash
+# On dev machine — should see "shipping N new lines"
+ctm-agent --help
+
+# On Pi — watch the log
+tail -f ~/.ctm.log
+```
+
+### Finding your Pi's hostname
+
+Most Pi OS installations advertise as `raspberrypi.local` on the LAN via mDNS.
+If that doesn't work, find the IP with `hostname -I` on the Pi and use it directly
+in `pi_host`.
+
+### Security note
+
+The shared secret prevents random LAN devices from pushing data to your Pi.
+The connection is plain HTTP — it's fine for a home network. If you expose the
+Pi to the internet, put it behind a reverse proxy with TLS.
 
 ---
 

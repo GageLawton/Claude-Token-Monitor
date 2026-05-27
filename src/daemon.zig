@@ -1,11 +1,15 @@
-// Background daemon mode: polls for usage changes, sends email notifications.
-// Designed to run as a systemd service on Raspberry Pi.
+// Background daemon mode: monitors token usage and sends email alerts.
+// Two data sources are supported:
+//   local mode  — reads ~/.claude/projects/*.jsonl directly (dev machine)
+//   ingest mode — receives data pushed by ctm-agent (Pi Zero deployment)
 
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const UsageReader = @import("usage_reader.zig").UsageReader;
 const SessionTracker = @import("session_tracker.zig").SessionTracker;
 const WindowStats = @import("session_tracker.zig").WindowStats;
+const IngestState = @import("ingest_state.zig").IngestState;
+const IngestServer = @import("ingest_server.zig").Server;
 const email = @import("email.zig");
 
 const PID_FILE = "/var/run/ctm.pid";
@@ -25,9 +29,85 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 
     logInfo(log_file, "ctm daemon started", .{});
 
+    if (config.ingest_server.enabled) {
+        try runIngestMode(allocator, config, log_file);
+    } else {
+        try runLocalMode(allocator, config, log_file);
+    }
+}
+
+// ── Ingest mode (Pi Zero): receive data from ctm-agent over HTTP ─────────────
+
+const ServerThreadArgs = struct {
+    allocator: std.mem.Allocator,
+    state: *IngestState,
+    config: Config,
+};
+
+fn serverThread(args: *ServerThreadArgs) void {
+    var srv = IngestServer{
+        .allocator = args.allocator,
+        .state = args.state,
+        .shared_secret = args.config.ingest_server.shared_secret,
+    };
+    srv.run(args.config.ingest_server.bind_host, args.config.ingest_server.bind_port) catch |err| {
+        std.log.err("ingest server crashed: {}", .{err});
+    };
+}
+
+fn runIngestMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs.File) !void {
+    var state = IngestState.init(allocator);
+    defer state.deinit();
+
+    var thread_args = ServerThreadArgs{
+        .allocator = allocator,
+        .state = &state,
+        .config = config,
+    };
+    const srv_thread = try std.Thread.spawn(.{}, serverThread, .{&thread_args});
+    srv_thread.detach();
+
+    logInfo(log_file, "ingest mode: listening on {s}:{d}", .{
+        config.ingest_server.bind_host, config.ingest_server.bind_port,
+    });
+
+    try monitorLoop(allocator, config, log_file, struct {
+        state: *IngestState,
+        alloc: std.mem.Allocator,
+
+        pub fn getEntries(self: @This(), arena: std.mem.Allocator) ![]const @import("usage_reader.zig").UsageEntry {
+            _ = arena;
+            return self.state.snapshot(self.alloc);
+        }
+    }{ .state = &state, .alloc = allocator });
+}
+
+// ── Local mode (dev machine): read JSONL files directly ──────────────────────
+
+fn runLocalMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs.File) !void {
     const data_path = try config.getClaudeDataPath(allocator);
     defer if (config.claude_data_path == null) allocator.free(data_path);
 
+    logInfo(log_file, "local mode: reading {s}", .{data_path});
+
+    try monitorLoop(allocator, config, log_file, struct {
+        path: []const u8,
+
+        pub fn getEntries(self: @This(), arena: std.mem.Allocator) ![]const @import("usage_reader.zig").UsageEntry {
+            var reader = UsageReader.init(arena, self.path);
+            return reader.readAll();
+        }
+    }{ .path = data_path });
+}
+
+// ── Shared monitoring loop ────────────────────────────────────────────────────
+
+fn monitorLoop(
+    allocator: std.mem.Allocator,
+    config: Config,
+    log_file: ?std.fs.File,
+    source: anytype,
+) !void {
     var prev_stats: ?WindowStats = null;
     var notified_limit = false;
     var notified_threshold = false;
@@ -37,8 +117,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var reader = UsageReader.init(a, data_path);
-        const entries = reader.readAll() catch {
+        const entries = source.getEntries(a) catch {
             logInfo(log_file, "failed to read usage data", .{});
             std.time.sleep(std.time.ns_per_s * config.refresh_interval_seconds);
             continue;
@@ -46,16 +125,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 
         const tracker = SessionTracker.init(a, entries, config.plan);
         const stats = tracker.currentWindowStats();
-
         const pct = stats.usagePercent();
 
-        // Detect reset: was at limit last cycle, now tokens are available again.
         if (config.notify_on_reset) {
             if (prev_stats) |prev| {
                 if (prev.is_at_limit and !stats.is_at_limit) {
                     notified_limit = false;
                     notified_threshold = false;
-                    logInfo(log_file, "token window reset detected — sending email", .{});
+                    logInfo(log_file, "token window reset — sending email", .{});
                     email.sendNotification(a, config.email, .tokens_reset, stats.tokens_used, stats.token_limit) catch |err| {
                         logInfo(log_file, "email send failed: {}", .{err});
                     };
@@ -63,7 +140,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
             }
         }
 
-        // Threshold notification (once per window)
         if (!notified_threshold and pct >= @as(f64, @floatFromInt(config.notify_threshold_percent))) {
             notified_threshold = true;
             logInfo(log_file, "threshold {d}% reached — sending email", .{config.notify_threshold_percent});
@@ -74,14 +150,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
 
         if (stats.is_at_limit and !notified_limit) {
             notified_limit = true;
-            logInfo(log_file, "token limit reached ({d}/{d})", .{ stats.tokens_used, stats.token_limit });
+            logInfo(log_file, "limit reached ({d}/{d})", .{ stats.tokens_used, stats.token_limit });
         }
 
-        logInfo(log_file, "usage: {d}/{d} ({d:.1}%) reset_in={}s", .{
+        logInfo(log_file, "usage: {d}/{d} ({d:.1}%) reset_in={d}s", .{
             stats.tokens_used, stats.token_limit, pct, stats.secondsUntilReset(),
         });
 
-        // Copy relevant fields for next iteration (arena will be freed)
         prev_stats = WindowStats{
             .tokens_used = stats.tokens_used,
             .token_limit = stats.token_limit,
@@ -135,23 +210,11 @@ fn writePidFile() !void {
 }
 
 fn logInfo(file: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
-    var ts_buf: [32]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const ts = std.time.timestamp();
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{ts}) catch "0";
-
-    const line = std.fmt.allocPrint(
-        std.heap.page_allocator,
-        "[{s}] ctm: " ++ fmt ++ "\n",
-        .{ts_str} ++ args,
-    ) catch return;
-    defer std.heap.page_allocator.free(line);
-
+    const line = std.fmt.bufPrint(&buf, "[{d}] ctm: " ++ fmt ++ "\n", .{ts} ++ args) catch return;
     if (file) |f| {
-        _ = f.pwrite(line, std.math.maxInt(u64)) catch {};
         f.seekFromEnd(0) catch {};
         f.writeAll(line) catch {};
     }
-
-    // Also write to syslog via stderr before it's redirected
-    std.io.getStdErr().writeAll(line) catch {};
 }

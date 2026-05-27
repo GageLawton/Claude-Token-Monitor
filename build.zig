@@ -20,6 +20,25 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the token monitor");
     run_step.dependOn(&run_cmd.step);
 
+    // ── ctm-agent binary (dev machine) ──────────────────────────────
+    const agent_exe = b.addExecutable(.{
+        .name = "ctm-agent",
+        .root_source_file = b.path("src/agent/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Agent imports config + usage_reader from the main src tree.
+    agent_exe.root_module.addAnonymousImport("config", .{
+        .root_source_file = b.path("src/config.zig"),
+    });
+    b.installArtifact(agent_exe);
+
+    const run_agent_cmd = b.addRunArtifact(agent_exe);
+    run_agent_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_agent_cmd.addArgs(args);
+    const run_agent_step = b.step("run-agent", "Run ctm-agent on the dev machine");
+    run_agent_step.dependOn(&run_agent_cmd.step);
+
     // ── Test suite ───────────────────────────────────────────────────
     // We compile each test file as its own test binary, but expose the
     // source modules under stable import names so tests can pull them in
@@ -53,6 +72,9 @@ pub fn build(b: *std.Build) void {
         });
         t.root_module.addAnonymousImport("session_tracker", .{
             .root_source_file = b.path("src/session_tracker.zig"),
+        });
+        t.root_module.addAnonymousImport("ingest_state", .{
+            .root_source_file = b.path("src/ingest_state.zig"),
         });
 
         if (coverage) {
