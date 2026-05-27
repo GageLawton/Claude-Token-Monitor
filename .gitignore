@@ -1,0 +1,15 @@
+.zig-cache/
+zig-out/
+zig-cache/
+*.o
+*.a
+
+# Config with real credentials
+config.json
+*.pid
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp

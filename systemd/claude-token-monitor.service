@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Token Monitor
+Documentation=https://github.com/GageLawton/Claude-Token-Monitor
+After=network.target
+
+[Service]
+Type=forking
+# Replace with the actual user who runs Claude Code
+User=%i
+ExecStart=/usr/local/bin/ctm --daemon --config /home/%i/.config/ctm/config.json
+Restart=on-failure
+RestartSec=30
+# Give it access to the user's home directory for ~/.claude/projects
+Environment=HOME=/home/%i
+
+[Install]
+WantedBy=multi-user.target

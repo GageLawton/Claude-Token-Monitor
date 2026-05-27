@@ -1,0 +1,20 @@
+{
+  "plan": "pro",
+  "refresh_interval_seconds": 30,
+  "notify_on_reset": true,
+  "notify_threshold_percent": 80,
+
+  "email": {
+    "enabled": true,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "username": "you@gmail.com",
+    "password": "your-app-password",
+    "from": "you@gmail.com",
+    "to": "notify@youremail.com"
+  },
+
+  "claude_data_path": null,
+
+  "log_file": "/var/log/ctm.log"
+}
