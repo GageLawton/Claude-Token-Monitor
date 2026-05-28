@@ -2,6 +2,11 @@ const std = @import("std");
 const testing = std.testing;
 const usage = @import("usage_reader");
 
+// Pin "now" to 1 hour after the earliest test entry so age-filtering is
+// consistent regardless of when the test suite runs.
+// 2024-06-01T10:00:00Z = Unix 1717236000; +3600s = 1717239600.
+const TEST_NOW_S: i64 = 1717239600;
+
 test "parseIso8601 converts basic timestamp to unix seconds" {
     const ts = try usage.parseIso8601("2024-01-15T10:30:00.000Z");
     // 2024-01-15T10:30:00 UTC = 1705314600
@@ -84,7 +89,7 @@ test "UsageReader parses real-shaped JSONL and deduplicates by uuid" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const projects_path = try tmp.dir.realpath("projects", &path_buf);
 
-    var reader = usage.UsageReader.init(testing.allocator, projects_path);
+    var reader = usage.UsageReader.initWithOptions(testing.allocator, projects_path, .{ .now_s = TEST_NOW_S });
     const entries = try reader.readAll();
     defer {
         for (entries) |e| e.deinit(testing.allocator);
@@ -132,7 +137,7 @@ test "UsageReader skips malformed JSON lines without failing" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const projects_path = try tmp.dir.realpath("projects", &path_buf);
 
-    var reader = usage.UsageReader.init(testing.allocator, projects_path);
+    var reader = usage.UsageReader.initWithOptions(testing.allocator, projects_path, .{ .now_s = TEST_NOW_S });
     const entries = try reader.readAll();
     defer {
         for (entries) |e| e.deinit(testing.allocator);

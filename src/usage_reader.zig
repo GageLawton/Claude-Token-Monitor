@@ -21,16 +21,38 @@ pub const UsageEntry = struct {
     }
 };
 
+// Default grace window: any entry whose timestamp falls within the last
+// 5h + 10min is kept. Anything older is discarded at parse time.
+pub const WINDOW_SECONDS: i64 = 5 * 60 * 60;
+pub const GRACE_SECONDS: i64 = 10 * 60;
+pub const DEFAULT_MAX_AGE_SECONDS: i64 = WINDOW_SECONDS + GRACE_SECONDS;
+
+pub const ParseOptions = struct {
+    // Reject entries older than (now - max_age_seconds). 0 disables the filter.
+    max_age_seconds: i64 = DEFAULT_MAX_AGE_SECONDS,
+    now_s: ?i64 = null, // override for tests
+};
+
 pub const UsageReader = struct {
     allocator: std.mem.Allocator,
     data_path: []const u8,
+    options: ParseOptions,
 
     pub fn init(allocator: std.mem.Allocator, data_path: []const u8) UsageReader {
-        return .{ .allocator = allocator, .data_path = data_path };
+        return .{ .allocator = allocator, .data_path = data_path, .options = .{} };
     }
 
-    // Reads all usage entries from ~/.claude/projects/**/*.jsonl
-    // Caller owns the returned slice and must call deinit on each entry.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        data_path: []const u8,
+        options: ParseOptions,
+    ) UsageReader {
+        return .{ .allocator = allocator, .data_path = data_path, .options = options };
+    }
+
+    // Reads every JSONL file under data_path. Streams line-by-line, so peak
+    // memory is bounded by the longest single line rather than file size.
+    // Returns a deduplicated slice; caller owns and must call deinit on each.
     pub fn readAll(self: *UsageReader) ![]UsageEntry {
         var entries = std.ArrayList(UsageEntry).init(self.allocator);
         errdefer {
@@ -38,7 +60,6 @@ pub const UsageReader = struct {
             entries.deinit();
         }
 
-        // Use a StringHashMap to deduplicate by UUID
         var seen = std.StringHashMap(void).init(self.allocator);
         defer {
             var it = seen.keyIterator();
@@ -64,7 +85,7 @@ pub const UsageReader = struct {
                 if (file_entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, file_entry.name, ".jsonl")) continue;
 
-                self.readJsonlFile(proj_dir, file_entry.name, &entries, &seen) catch |err| {
+                self.streamJsonlFile(proj_dir, file_entry.name, &entries, &seen) catch |err| {
                     std.log.warn("skipping {s}: {}", .{ file_entry.name, err });
                 };
             }
@@ -73,7 +94,7 @@ pub const UsageReader = struct {
         return entries.toOwnedSlice();
     }
 
-    fn readJsonlFile(
+    fn streamJsonlFile(
         self: *UsageReader,
         dir: std.fs.Dir,
         filename: []const u8,
@@ -83,93 +104,108 @@ pub const UsageReader = struct {
         const file = try dir.openFile(filename, .{});
         defer file.close();
 
-        const content = try file.readToEndAlloc(self.allocator, 32 * 1024 * 1024);
-        defer self.allocator.free(content);
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var line_buf = std.ArrayList(u8).init(self.allocator);
+        defer line_buf.deinit();
 
-        var line_iter = std.mem.splitScalar(u8, content, '\n');
-        while (line_iter.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
+        while (true) {
+            line_buf.clearRetainingCapacity();
+            buf_reader.reader().streamUntilDelimiter(line_buf.writer(), '\n', null) catch |err| {
+                if (err == error.EndOfStream) {
+                    if (line_buf.items.len == 0) break;
+                    // fall through to process the final un-newlined line
+                } else {
+                    return err;
+                }
+            };
+            const trimmed = std.mem.trim(u8, line_buf.items, " \t\r");
             if (trimmed.len == 0) continue;
-            self.parseLine(trimmed, entries, seen) catch {};
+            self.consumeLine(trimmed, entries, seen) catch {};
         }
     }
 
-    fn parseLine(
+    fn consumeLine(
         self: *UsageReader,
         line: []const u8,
         entries: *std.ArrayList(UsageEntry),
         seen: *std.StringHashMap(void),
     ) !void {
-        const entry = try parseEntryFromLine(self.allocator, line) orelse return;
+        const entry = (try parseEntryFromLine(self.allocator, line, self.options)) orelse return;
         if (seen.contains(entry.uuid)) {
             entry.deinit(self.allocator);
             return;
         }
-        try seen.put(try self.allocator.dupe(u8, entry.uuid), {});
+        const owned_key = try self.allocator.dupe(u8, entry.uuid);
+        errdefer self.allocator.free(owned_key);
+        try seen.put(owned_key, {});
         try entries.append(entry);
     }
 };
 
-// Public: parse a single JSONL line into a UsageEntry. Returns null for non-assistant
-// lines or malformed input. Caller owns the returned entry and must call deinit.
-pub fn parseEntryFromLine(allocator: std.mem.Allocator, line: []const u8) !?UsageEntry {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{
+// JSONL line shape written by Claude Code. Only the fields we need.
+// All optional so missing/unknown fields don't fail the parse.
+const RawLine = struct {
+    type: ?[]const u8 = null,
+    uuid: ?[]const u8 = null,
+    sessionId: ?[]const u8 = null,
+    timestamp: ?[]const u8 = null,
+    costUSD: ?f64 = null,
+    message: ?MessageBlock = null,
+
+    const MessageBlock = struct {
+        usage: ?UsageBlock = null,
+    };
+
+    const UsageBlock = struct {
+        input_tokens: ?u64 = null,
+        output_tokens: ?u64 = null,
+        cache_creation_input_tokens: ?u64 = null,
+        cache_read_input_tokens: ?u64 = null,
+    };
+};
+
+// Parses a single JSONL line into a UsageEntry. Returns null for:
+//   - non-assistant entries
+//   - malformed JSON
+//   - entries older than options.max_age_seconds
+// Caller owns the returned entry and must call deinit.
+pub fn parseEntryFromLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    options: ParseOptions,
+) !?UsageEntry {
+    var parsed = std.json.parseFromSlice(RawLine, allocator, line, .{
         .ignore_unknown_fields = true,
-    });
+    }) catch return null;
     defer parsed.deinit();
 
-    const root = parsed.value;
-    if (root != .object) return null;
-    const obj = root.object;
+    const raw = parsed.value;
 
-    const type_val = obj.get("type") orelse return null;
-    if (type_val != .string) return null;
-    if (!std.mem.eql(u8, type_val.string, "assistant")) return null;
+    const type_str = raw.type orelse return null;
+    if (!std.mem.eql(u8, type_str, "assistant")) return null;
 
-    const uuid_val = obj.get("uuid") orelse return null;
-    if (uuid_val != .string) return null;
+    const uuid = raw.uuid orelse return null;
+    const session_id = raw.sessionId orelse return null;
+    const ts_str = raw.timestamp orelse return null;
+    const message = raw.message orelse return null;
+    const usage = message.usage orelse return null;
 
-    const ts_val = obj.get("timestamp") orelse return null;
-    if (ts_val != .string) return null;
-    const ts_s = parseIso8601(ts_val.string) catch return null;
+    const ts_s = parseIso8601(ts_str) catch return null;
 
-    const session_val = obj.get("sessionId") orelse return null;
-    if (session_val != .string) return null;
-
-    var cost: f64 = 0;
-    if (obj.get("costUSD")) |v| {
-        cost = switch (v) {
-            .float => |f| f,
-            .integer => |i| @floatFromInt(i),
-            else => 0,
-        };
+    if (options.max_age_seconds > 0) {
+        const now = options.now_s orelse std.time.timestamp();
+        if (ts_s < now - options.max_age_seconds) return null;
     }
-
-    const msg_val = obj.get("message") orelse return null;
-    if (msg_val != .object) return null;
-    const msg = msg_val.object;
-
-    const usage_val = msg.get("usage") orelse return null;
-    if (usage_val != .object) return null;
-    const usage = usage_val.object;
 
     return .{
         .timestamp_s = ts_s,
-        .session_id = try allocator.dupe(u8, session_val.string),
-        .uuid = try allocator.dupe(u8, uuid_val.string),
-        .input_tokens = jsonUint(usage, "input_tokens"),
-        .output_tokens = jsonUint(usage, "output_tokens"),
-        .cache_create_tokens = jsonUint(usage, "cache_creation_input_tokens"),
-        .cache_read_tokens = jsonUint(usage, "cache_read_input_tokens"),
-        .cost_usd = cost,
-    };
-}
-
-fn jsonUint(obj: std.json.ObjectMap, key: []const u8) u64 {
-    const v = obj.get(key) orelse return 0;
-    return switch (v) {
-        .integer => |i| if (i > 0) @intCast(i) else 0,
-        else => 0,
+        .session_id = try allocator.dupe(u8, session_id),
+        .uuid = try allocator.dupe(u8, uuid),
+        .input_tokens = usage.input_tokens orelse 0,
+        .output_tokens = usage.output_tokens orelse 0,
+        .cache_create_tokens = usage.cache_creation_input_tokens orelse 0,
+        .cache_read_tokens = usage.cache_read_input_tokens orelse 0,
+        .cost_usd = raw.costUSD orelse 0,
     };
 }
 
@@ -191,7 +227,7 @@ pub fn parseIso8601(s: []const u8) !i64 {
     return days * 86400 + hour * 3600 + minute * 60 + second;
 }
 
-// Howard Hinnant's civil_from_days in reverse.
+// Howard Hinnant's civil_from_days, reversed.
 fn civilToDays(year: i64, month: i64, day: i64) i64 {
     const y = if (month <= 2) year - 1 else year;
     const era = @divFloor(y, 400);
@@ -201,12 +237,33 @@ fn civilToDays(year: i64, month: i64, day: i64) i64 {
     return era * 146097 + doe - 719468;
 }
 
-test "parseIso8601" {
+test "parseIso8601 known values" {
     const ts = try parseIso8601("2024-01-15T10:30:00.000Z");
-    try std.testing.expect(ts > 0);
+    try std.testing.expectEqual(@as(i64, 1705314600), ts);
 }
 
 test "civilToDays epoch" {
-    // 1970-01-01 should be day 0
     try std.testing.expectEqual(@as(i64, 0), civilToDays(1970, 1, 1));
+}
+
+test "parseEntryFromLine drops entries older than max_age_seconds" {
+    const allocator = std.testing.allocator;
+    const old_line =
+        \\{"type":"assistant","uuid":"u1","sessionId":"s","timestamp":"2000-01-01T00:00:00Z","message":{"usage":{"input_tokens":10}}}
+    ;
+    // now=2024 with default max_age means a 2000 entry must be dropped.
+    const opts = ParseOptions{ .now_s = 1705314600, .max_age_seconds = DEFAULT_MAX_AGE_SECONDS };
+    const result = try parseEntryFromLine(allocator, old_line, opts);
+    try std.testing.expect(result == null);
+}
+
+test "parseEntryFromLine keeps recent entries" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"type":"assistant","uuid":"u2","sessionId":"s","timestamp":"2024-01-15T10:30:00Z","message":{"usage":{"input_tokens":100,"output_tokens":200}}}
+    ;
+    const opts = ParseOptions{ .now_s = 1705314600 + 60, .max_age_seconds = DEFAULT_MAX_AGE_SECONDS };
+    const entry = (try parseEntryFromLine(allocator, line, opts)) orelse return error.UnexpectedNull;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 300), entry.totalTokens());
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const Dashboard = @import("dashboard.zig").Dashboard;
 const UsageReader = @import("usage_reader.zig").UsageReader;
@@ -7,10 +8,24 @@ const daemon = @import("daemon.zig");
 
 const Mode = enum { monitor, daemon_mode, status, help };
 
+// Release builds use c_allocator (low overhead, libc malloc/free).
+// Debug/test builds use GeneralPurposeAllocator for leak detection.
+var debug_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+fn pickAllocator() std.mem.Allocator {
+    return switch (builtin.mode) {
+        .Debug => debug_gpa.allocator(),
+        else => std.heap.c_allocator,
+    };
+}
+
+fn deinitAllocator() void {
+    if (builtin.mode == .Debug) _ = debug_gpa.deinit();
+}
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = pickAllocator();
+    defer deinitAllocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -33,7 +48,8 @@ pub fn main() !void {
         }
     }
 
-    const config = loadConfig(allocator, config_path);
+    var config = loadConfig(allocator, config_path);
+    defer config.deinit(allocator);
 
     switch (mode) {
         .help => printHelp(),
@@ -55,6 +71,12 @@ fn loadConfig(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
             break :blk std.fs.path.join(allocator, &.{ home, ".ctm.json" }) catch null;
         },
     };
+    defer {
+        // Free the joined paths we built above (skip the explicit one — caller owns it).
+        for (paths_to_try[1..]) |maybe_path| {
+            if (maybe_path) |p| allocator.free(p);
+        }
+    }
 
     for (paths_to_try) |maybe_path| {
         const path = maybe_path orelse continue;
@@ -127,8 +149,9 @@ fn printHelp() void {
         \\  ctm -c ~/my.json     # custom config
         \\
         \\DATA
-        \\  Reads from ~/.claude/projects/**/*.jsonl (written by Claude Code CLI)
-        \\  No separate login required — uses Claude Code's existing session data.
+        \\  Reads from ~/.claude/projects/**/*.jsonl (written by Claude Code CLI).
+        \\  For the Pi Zero deployment, enable ingest_server in config.json and
+        \\  run ctm-agent on your dev machine to push data over the LAN.
         \\
     , .{});
 }

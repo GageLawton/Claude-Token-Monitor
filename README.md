@@ -1,5 +1,7 @@
 # Claude Token Monitor (ctm)
 
+[![CI](https://github.com/GageLawton/Claude-Token-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/GageLawton/Claude-Token-Monitor/actions/workflows/ci.yml)
+
 A lightweight, native **Zig** monitor for Claude Code token usage. Designed to
 run quietly in the background on a Raspberry Pi (or any Linux box) and email
 you the moment your 5-hour token window resets.
@@ -38,9 +40,10 @@ quota frees up.
                                            └─ email on threshold
 ```
 
-`ctm-agent` uses `stat()` polling to detect new JSONL lines and ships only the
-new bytes — nothing is ever re-read. The Pi holds entries in memory and prunes
-anything older than 6h, keeping RSS well under 8 MB.
+`ctm-agent` uses **inotify** on Linux (stat-poll fallback on macOS) to detect
+new JSONL lines and ships only the new bytes — nothing is ever re-read.
+The Pi holds entries in memory and prunes anything older than 6 hours,
+keeping RSS well under 8 MB.
 
 ---
 
@@ -84,14 +87,17 @@ sudo cp zig-out/bin/ctm /usr/local/bin/
 ### Cross-compile for a Pi from another machine
 
 ```bash
-# 64-bit Pi (Pi 4 / 5 with 64-bit OS)
+# Pi 4 / 5 (64-bit OS)
 zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
 
-# 32-bit Pi (Pi Zero / older Pi 3)
-zig build -Dtarget=armv7a-linux-musleabihf -Doptimize=ReleaseSafe
+# Pi 2 / 3 (32-bit ARMv7 OS)
+zig build -Dtarget=arm-linux-musleabihf -Doptimize=ReleaseSafe
+
+# Pi Zero / Zero W (ARMv6 — no official Zig binary, must cross-compile)
+zig build -Dtarget=arm-linux-musleabihf -Dcpu=arm1176jzf_s -Doptimize=ReleaseSafe
 ```
 
-The resulting binary in `zig-out/bin/ctm` is fully static — copy it anywhere.
+The resulting binary in `zig-out/bin/ctm` is fully static — copy it to the Pi with `scp`.
 
 ---
 
@@ -272,7 +278,13 @@ It will auto-start on boot and restart if it crashes.
 │   ├── session_tracker.zig 5-hour window math, burn rate, summaries
 │   ├── dashboard.zig       Live terminal UI
 │   ├── email.zig           SMTP notifications
-│   └── daemon.zig          Background daemon mode
+│   ├── daemon.zig          Background daemon mode
+│   ├── watcher.zig         inotify + stat-poll file watcher (shared)
+│   ├── ingest_state.zig    Thread-safe in-memory entry store
+│   ├── ingest_server.zig   HTTP endpoint (Pi receives pushed data)
+│   └── agent/
+│       ├── main.zig        ctm-agent entry point (dev machine)
+│       └── shipper.zig     HTTP POST to Pi ingest endpoint
 ├── tests/                  Unit tests (one file per source module)
 ├── systemd/                Service unit template
 ├── scripts/                Install + coverage helpers

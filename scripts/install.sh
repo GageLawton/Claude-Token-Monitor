@@ -8,10 +8,11 @@ SERVICE_NAME="claude-token-monitor"
 ZIG_VERSION="0.13.0"
 ARCH=$(uname -m)
 
-# Map arch to Zig's naming
+# Map arch to Zig's download archive name (empty = no official binary).
 case "$ARCH" in
   aarch64|arm64) ZIG_ARCH="aarch64-linux" ;;
   armv7l|armhf)  ZIG_ARCH="armv7a-linux-gnueabihf" ;;
+  armv6l)        ZIG_ARCH="" ;;   # Pi Zero — no official Zig binary; handled below
   x86_64)        ZIG_ARCH="x86_64-linux" ;;
   *)
     echo "Unsupported arch: $ARCH"
@@ -19,8 +20,21 @@ case "$ARCH" in
     ;;
 esac
 
-# Check for Zig
+# Check for Zig or download it
 if ! command -v zig &>/dev/null; then
+  if [ -z "$ZIG_ARCH" ]; then
+    echo "No official Zig binary for $ARCH (Pi Zero / ARMv6)."
+    echo ""
+    echo "Option 1 — cross-compile on a faster machine and copy the binary:"
+    echo "  zig build -Dtarget=arm-linux-musleabihf -Dcpu=arm1176jzf_s -Doptimize=ReleaseSafe"
+    echo "  scp zig-out/bin/ctm pi@raspberrypi.local:/usr/local/bin/ctm"
+    echo "  scp zig-out/bin/ctm-agent user@devmachine:/usr/local/bin/ctm-agent"
+    echo ""
+    echo "Option 2 — install Zig from the system package manager, then re-run:"
+    echo "  sudo apt install zig"
+    echo ""
+    exit 0
+  fi
   echo "Zig not found. Installing Zig $ZIG_VERSION for $ZIG_ARCH..."
   ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
   curl -fL "$ZIG_URL" | tar -xJ -C /tmp

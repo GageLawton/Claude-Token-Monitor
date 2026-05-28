@@ -1,11 +1,21 @@
-// Watches ~/.claude/projects/**/*.jsonl for new content.
-// Uses stat()-based polling so it works on Linux and macOS without inotify/kqueue.
-// Only the bytes added since the last check are returned — no re-reading.
+// Filesystem watcher for ~/.claude/projects/**/*.jsonl.
+//
+// Two strategies are tried at init time:
+//   1. Linux inotify — event-driven, ~0% idle CPU. Used on Pi Zero / Linux.
+//   2. stat() polling — cross-platform fallback for macOS or kernels without inotify.
+//
+// Either way, only NEW bytes are read from each file (per-file offsets stored
+// across calls). The caller polls() to receive new lines, and may call
+// waitForEvent() to block until the kernel hints that something changed.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+const is_linux = builtin.os.tag == .linux;
+const linux = std.os.linux;
 
 pub const NewData = struct {
-    lines: std.ArrayList([]u8), // each line is owned; caller must free
+    lines: std.ArrayList([]u8),
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *NewData) void {
@@ -14,7 +24,6 @@ pub const NewData = struct {
     }
 };
 
-// Tracks read position per file.
 const FileState = struct {
     offset: u64,
     mtime_ns: i128,
@@ -23,25 +32,85 @@ const FileState = struct {
 pub const Watcher = struct {
     allocator: std.mem.Allocator,
     projects_path: []const u8,
-    // Keyed by absolute file path.
     file_states: std.StringHashMap(FileState),
 
+    inotify_fd: i32 = -1, // -1 means inotify unavailable
+
     pub fn init(allocator: std.mem.Allocator, projects_path: []const u8) Watcher {
-        return .{
+        var w = Watcher{
             .allocator = allocator,
             .projects_path = projects_path,
             .file_states = std.StringHashMap(FileState).init(allocator),
         };
+        if (is_linux) {
+            w.tryInitInotify();
+        }
+        return w;
     }
 
     pub fn deinit(self: *Watcher) void {
+        if (self.inotify_fd >= 0) {
+            std.posix.close(self.inotify_fd);
+            self.inotify_fd = -1;
+        }
         var it = self.file_states.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.file_states.deinit();
     }
 
-    // Scans the project directory tree for JSONL files.
-    // Returns only the new lines written since the last call.
+    fn tryInitInotify(self: *Watcher) void {
+        if (!is_linux) return;
+
+        // inotify_init1 returns usize; negative-cast indicates error.
+        const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) return;
+        self.inotify_fd = @intCast(signed);
+
+        // Add a watch on the projects root. We re-scan the tree on every event
+        // so per-subdir watches aren't required — root events suffice as a
+        // "something changed" hint. A periodic timeout in waitForEvent catches
+        // the case where IN_MODIFY on a file in a subdir wouldn't bubble up.
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{self.projects_path}) catch {
+            std.posix.close(self.inotify_fd);
+            self.inotify_fd = -1;
+            return;
+        };
+        const mask = linux.IN.MODIFY | linux.IN.CREATE | linux.IN.MOVED_TO;
+        const wd_rc = linux.inotify_add_watch(self.inotify_fd, path_z.ptr, mask);
+        const wd_signed: isize = @bitCast(wd_rc);
+        if (wd_signed < 0) {
+            std.posix.close(self.inotify_fd);
+            self.inotify_fd = -1;
+            return;
+        }
+    }
+
+    // Blocks until either a filesystem event arrives or `timeout_ms` elapses.
+    // On non-Linux (no inotify), this just sleeps for `timeout_ms`.
+    pub fn waitForEvent(self: *Watcher, timeout_ms: i32) void {
+        if (self.inotify_fd >= 0) {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = self.inotify_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            _ = std.posix.poll(&pfd, timeout_ms) catch return;
+            // Drain whatever's queued — we'll rescan in poll() anyway.
+            var drain_buf: [4096]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(self.inotify_fd, &drain_buf) catch break;
+                if (n == 0) break;
+                if (n < drain_buf.len) break;
+            }
+        } else {
+            const ns: u64 = @as(u64, @intCast(@max(timeout_ms, 0))) * std.time.ns_per_ms;
+            std.time.sleep(ns);
+        }
+    }
+
+    // Scans for new lines added to any JSONL file since the last call.
     pub fn poll(self: *Watcher) !NewData {
         var new_data = NewData{
             .lines = std.ArrayList([]u8).init(self.allocator),
@@ -91,19 +160,15 @@ pub const Watcher = struct {
 
         const gop = try self.file_states.getOrPut(abs_path);
         if (!gop.found_existing) {
-            // New file: store path as owned key, start reading from byte 0.
             gop.key_ptr.* = try self.allocator.dupe(u8, abs_path);
             gop.value_ptr.* = .{ .offset = 0, .mtime_ns = meta.mtime };
         }
 
         const state = gop.value_ptr;
 
-        // File truncated (rotated): reset.
-        if (current_size < state.offset) {
-            state.offset = 0;
-        }
-
-        if (current_size == state.offset) return; // nothing new
+        // Truncation / rotation: re-read from the start.
+        if (current_size < state.offset) state.offset = 0;
+        if (current_size == state.offset) return;
 
         try file.seekTo(state.offset);
 

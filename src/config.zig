@@ -6,7 +6,6 @@ pub const Plan = enum {
     max20,
 
     // Approximate token limits per 5-hour rolling window.
-    // These match Claude's published rate limits; adjust if Anthropic changes them.
     pub fn tokenLimit(self: Plan) u64 {
         return switch (self) {
             .pro => 88_000,
@@ -30,51 +29,6 @@ pub const Plan = enum {
     }
 };
 
-// Config for the ctm-agent binary (runs on dev machine, ships data to Pi).
-pub const AgentConfig = struct {
-    pi_host: []const u8 = "raspberrypi.local",
-    pi_port: u16 = 7373,
-    shared_secret: []const u8 = "",
-    poll_interval_ms: u32 = 500,
-    claude_data_path: ?[]const u8 = null,
-
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !AgentConfig {
-        const file = std.fs.openFileAbsolute(path, .{}) catch return error.ConfigNotFound;
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 64 * 1024);
-        defer allocator.free(content);
-        const p = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
-        defer p.deinit();
-        if (p.value != .object) return error.InvalidConfig;
-        const obj = p.value.object;
-        var cfg = AgentConfig{};
-        if (obj.get("pi_host")) |v| if (v == .string) {
-            cfg.pi_host = try allocator.dupe(u8, v.string);
-        };
-        if (obj.get("pi_port")) |v| if (v == .integer) {
-            cfg.pi_port = @intCast(v.integer);
-        };
-        if (obj.get("shared_secret")) |v| if (v == .string) {
-            cfg.shared_secret = try allocator.dupe(u8, v.string);
-        };
-        if (obj.get("poll_interval_ms")) |v| if (v == .integer) {
-            cfg.poll_interval_ms = @intCast(v.integer);
-        };
-        if (obj.get("claude_data_path")) |v| if (v == .string) {
-            cfg.claude_data_path = try allocator.dupe(u8, v.string);
-        };
-        return cfg;
-    }
-};
-
-// Config for the HTTP ingest server embedded in ctm (runs on Pi).
-pub const IngestServerConfig = struct {
-    enabled: bool = false,
-    bind_host: []const u8 = "0.0.0.0",
-    bind_port: u16 = 7373,
-    shared_secret: []const u8 = "",
-};
-
 pub const EmailConfig = struct {
     enabled: bool = false,
     smtp_host: []const u8 = "smtp.gmail.com",
@@ -83,6 +37,70 @@ pub const EmailConfig = struct {
     password: []const u8 = "",
     from: []const u8 = "",
     to: []const u8 = "",
+};
+
+pub const IngestServerConfig = struct {
+    enabled: bool = false,
+    bind_host: []const u8 = "0.0.0.0",
+    bind_port: u16 = 7373,
+    shared_secret: []const u8 = "",
+};
+
+pub const AgentConfig = struct {
+    pi_host: []const u8 = "raspberrypi.local",
+    pi_port: u16 = 7373,
+    shared_secret: []const u8 = "",
+    poll_interval_ms: u32 = 500,
+    claude_data_path: ?[]const u8 = null,
+
+    // Underlying arena that owns every string field. null when the config
+    // came from default() (no allocations needed).
+    _arena: ?*std.heap.ArenaAllocator = null,
+
+    pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
+        if (self._arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+            self._arena = null;
+        }
+    }
+
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !AgentConfig {
+        const file = std.fs.openFileAbsolute(path, .{}) catch return error.ConfigNotFound;
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 64 * 1024);
+        defer allocator.free(content);
+
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        const a = arena.allocator();
+
+        const p = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+        if (p.value != .object) return error.InvalidConfig;
+        const obj = p.value.object;
+
+        var cfg = AgentConfig{ ._arena = arena };
+        if (obj.get("pi_host")) |v| if (v == .string) {
+            cfg.pi_host = try a.dupe(u8, v.string);
+        };
+        if (obj.get("pi_port")) |v| if (v == .integer) {
+            cfg.pi_port = @intCast(v.integer);
+        };
+        if (obj.get("shared_secret")) |v| if (v == .string) {
+            cfg.shared_secret = try a.dupe(u8, v.string);
+        };
+        if (obj.get("poll_interval_ms")) |v| if (v == .integer) {
+            cfg.poll_interval_ms = @intCast(v.integer);
+        };
+        if (obj.get("claude_data_path")) |v| if (v == .string) {
+            cfg.claude_data_path = try a.dupe(u8, v.string);
+        };
+        return cfg;
+    }
 };
 
 pub const Config = struct {
@@ -95,8 +113,19 @@ pub const Config = struct {
     claude_data_path: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
 
+    // Arena owning every string field allocated by load(). null for default().
+    _arena: ?*std.heap.ArenaAllocator = null,
+
     pub fn default() Config {
         return .{};
+    }
+
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        if (self._arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+            self._arena = null;
+        }
     }
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -106,14 +135,20 @@ pub const Config = struct {
         const content = try file.readToEndAlloc(allocator, 64 * 1024);
         defer allocator.free(content);
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
-        defer parsed.deinit();
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        const a = arena.allocator();
 
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
         const root = parsed.value;
         if (root != .object) return error.InvalidConfig;
         const obj = root.object;
 
-        var cfg = Config{};
+        var cfg = Config{ ._arena = arena };
 
         if (obj.get("plan")) |v| {
             if (v == .string) cfg.plan = Plan.fromString(v.string);
@@ -128,22 +163,26 @@ pub const Config = struct {
             if (v == .integer) cfg.notify_threshold_percent = @intCast(v.integer);
         }
         if (obj.get("claude_data_path")) |v| {
-            if (v == .string) cfg.claude_data_path = try allocator.dupe(u8, v.string);
+            if (v == .string) cfg.claude_data_path = try a.dupe(u8, v.string);
         }
         if (obj.get("log_file")) |v| {
-            if (v == .string) cfg.log_file = try allocator.dupe(u8, v.string);
+            if (v == .string) cfg.log_file = try a.dupe(u8, v.string);
         }
         if (obj.get("ingest_server")) |iv| {
             if (iv == .object) {
                 const io = iv.object;
                 var isc = IngestServerConfig{};
-                if (io.get("enabled")) |v| if (v == .bool) { isc.enabled = v.bool; };
-                if (io.get("bind_host")) |v| if (v == .string) {
-                    isc.bind_host = try allocator.dupe(u8, v.string);
+                if (io.get("enabled")) |v| if (v == .bool) {
+                    isc.enabled = v.bool;
                 };
-                if (io.get("bind_port")) |v| if (v == .integer) { isc.bind_port = @intCast(v.integer); };
+                if (io.get("bind_host")) |v| if (v == .string) {
+                    isc.bind_host = try a.dupe(u8, v.string);
+                };
+                if (io.get("bind_port")) |v| if (v == .integer) {
+                    isc.bind_port = @intCast(v.integer);
+                };
                 if (io.get("shared_secret")) |v| if (v == .string) {
-                    isc.shared_secret = try allocator.dupe(u8, v.string);
+                    isc.shared_secret = try a.dupe(u8, v.string);
                 };
                 cfg.ingest_server = isc;
             }
@@ -156,22 +195,22 @@ pub const Config = struct {
                     if (v == .bool) email.enabled = v.bool;
                 }
                 if (em.get("smtp_host")) |v| {
-                    if (v == .string) email.smtp_host = try allocator.dupe(u8, v.string);
+                    if (v == .string) email.smtp_host = try a.dupe(u8, v.string);
                 }
                 if (em.get("smtp_port")) |v| {
                     if (v == .integer) email.smtp_port = @intCast(v.integer);
                 }
                 if (em.get("username")) |v| {
-                    if (v == .string) email.username = try allocator.dupe(u8, v.string);
+                    if (v == .string) email.username = try a.dupe(u8, v.string);
                 }
                 if (em.get("password")) |v| {
-                    if (v == .string) email.password = try allocator.dupe(u8, v.string);
+                    if (v == .string) email.password = try a.dupe(u8, v.string);
                 }
                 if (em.get("from")) |v| {
-                    if (v == .string) email.from = try allocator.dupe(u8, v.string);
+                    if (v == .string) email.from = try a.dupe(u8, v.string);
                 }
                 if (em.get("to")) |v| {
-                    if (v == .string) email.to = try allocator.dupe(u8, v.string);
+                    if (v == .string) email.to = try a.dupe(u8, v.string);
                 }
                 cfg.email = email;
             }
@@ -180,13 +219,14 @@ pub const Config = struct {
         return cfg;
     }
 
-    // Returns the path to Claude's projects directory, caller must free if not claude_data_path.
+    // Returns the path to Claude's projects directory.
+    // The returned path is either borrowed (lives in the config arena) or
+    // allocated on `allocator`; callers should use `freeClaudeDataPath` to clean up.
     pub fn getClaudeDataPath(self: *const Config, allocator: std.mem.Allocator) ![]const u8 {
         if (self.claude_data_path) |p| return p;
 
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
 
-        // Try ~/.claude/projects first (standard Claude Code location)
         const path = try std.fs.path.join(allocator, &.{ home, ".claude", "projects" });
         if (std.fs.openDirAbsolute(path, .{}) catch null) |dir| {
             dir.close();
@@ -194,7 +234,13 @@ pub const Config = struct {
         }
         allocator.free(path);
 
-        // Fall back to ~/.config/claude/projects (XDG path)
         return std.fs.path.join(allocator, &.{ home, ".config", "claude", "projects" });
+    }
+
+    pub fn freeClaudeDataPath(self: *const Config, allocator: std.mem.Allocator, path: []const u8) void {
+        // If the path came from our arena, freeing it here is wrong — the
+        // arena owns it. Only free if the path was allocated by `allocator`
+        // (i.e. claude_data_path wasn't set in the config).
+        if (self.claude_data_path == null) allocator.free(path);
     }
 };

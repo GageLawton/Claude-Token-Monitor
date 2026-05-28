@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const AgentConfig = @import("../../src/config.zig").AgentConfig;
-const Watcher = @import("watcher.zig").Watcher;
+const Watcher = @import("watcher").Watcher;
 const shipper = @import("shipper.zig");
 
 pub fn main() !void {

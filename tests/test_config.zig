@@ -43,14 +43,8 @@ test "Config.load parses a full config from JSON" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp.dir.realpath("config.json", &path_buf);
 
-    const c = try config.Config.load(testing.allocator, path);
-    defer {
-        if (c.email.smtp_host.len > 0) testing.allocator.free(c.email.smtp_host);
-        if (c.email.username.len > 0) testing.allocator.free(c.email.username);
-        if (c.email.password.len > 0) testing.allocator.free(c.email.password);
-        if (c.email.from.len > 0) testing.allocator.free(c.email.from);
-        if (c.email.to.len > 0) testing.allocator.free(c.email.to);
-    }
+    var c = try config.Config.load(testing.allocator, path);
+    defer c.deinit(testing.allocator);
 
     try testing.expectEqual(config.Plan.max5, c.plan);
     try testing.expectEqual(@as(u32, 60), c.refresh_interval_seconds);
@@ -74,7 +68,8 @@ test "Config.load applies defaults when fields are missing" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp.dir.realpath("config.json", &path_buf);
 
-    const c = try config.Config.load(testing.allocator, path);
+    var c = try config.Config.load(testing.allocator, path);
+    defer c.deinit(testing.allocator);
 
     try testing.expectEqual(config.Plan.max20, c.plan);
     // Defaults preserved
