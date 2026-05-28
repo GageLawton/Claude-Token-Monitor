@@ -6,7 +6,7 @@ const UsageReader = @import("usage_reader.zig").UsageReader;
 const SessionTracker = @import("session_tracker.zig").SessionTracker;
 const daemon = @import("daemon.zig");
 
-const Mode = enum { monitor, daemon_mode, status, help };
+const Mode = enum { monitor, daemon_mode, status, gen_secret, help };
 
 // Release builds use c_allocator (low overhead, libc malloc/free).
 // Debug/test builds use GeneralPurposeAllocator for leak detection.
@@ -40,6 +40,8 @@ pub fn main() !void {
             mode = .daemon_mode;
         } else if (std.mem.eql(u8, arg, "--status") or std.mem.eql(u8, arg, "-s")) {
             mode = .status;
+        } else if (std.mem.eql(u8, arg, "--gen-secret")) {
+            mode = .gen_secret;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             mode = .help;
         } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
@@ -48,14 +50,17 @@ pub fn main() !void {
         }
     }
 
+    if (mode == .gen_secret) { genSecret(); return; }
+    if (mode == .help) { printHelp(); return; }
+
     var config = loadConfig(allocator, config_path);
     defer config.deinit(allocator);
 
     switch (mode) {
-        .help => printHelp(),
         .status => try runStatus(allocator, config),
         .daemon_mode => try daemon.run(allocator, config),
         .monitor => try Dashboard.run(allocator, config),
+        .gen_secret, .help => unreachable,
     }
 }
 
@@ -122,6 +127,14 @@ fn runStatus(allocator: std.mem.Allocator, config: Config) !void {
     try stdout.print("\n", .{});
 }
 
+fn genSecret() void {
+    var bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    const stdout = std.io.getStdOut().writer();
+    for (bytes) |b| stdout.print("{x:0>2}", .{b}) catch {};
+    stdout.print("\n", .{}) catch {};
+}
+
 fn printHelp() void {
     std.debug.print(
         \\Claude Token Monitor (ctm) v0.1
@@ -133,6 +146,7 @@ fn printHelp() void {
         \\OPTIONS
         \\  -d, --daemon       Run as background daemon (email alerts)
         \\  -s, --status       Print current status and exit
+        \\      --gen-secret   Print a random 256-bit hex secret and exit
         \\  -c, --config PATH  Use a specific config file
         \\  -h, --help         Show this help
         \\
@@ -147,6 +161,7 @@ fn printHelp() void {
         \\  ctm -s               # one-shot status
         \\  ctm -d               # background daemon with email alerts
         \\  ctm -c ~/my.json     # custom config
+        \\  ctm --gen-secret     # generate a shared secret for Pi setup
         \\
         \\DATA
         \\  Reads from ~/.claude/projects/**/*.jsonl (written by Claude Code CLI).

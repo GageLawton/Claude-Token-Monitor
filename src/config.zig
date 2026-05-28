@@ -112,6 +112,7 @@ pub const Config = struct {
     ingest_server: IngestServerConfig = .{},
     claude_data_path: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
+    state_file: ?[]const u8 = null,
 
     // Arena owning every string field allocated by load(). null for default().
     _arena: ?*std.heap.ArenaAllocator = null,
@@ -167,6 +168,9 @@ pub const Config = struct {
         }
         if (obj.get("log_file")) |v| {
             if (v == .string) cfg.log_file = try a.dupe(u8, v.string);
+        }
+        if (obj.get("state_file")) |v| {
+            if (v == .string) cfg.state_file = try a.dupe(u8, v.string);
         }
         if (obj.get("ingest_server")) |iv| {
             if (iv == .object) {
@@ -238,9 +242,19 @@ pub const Config = struct {
     }
 
     pub fn freeClaudeDataPath(self: *const Config, allocator: std.mem.Allocator, path: []const u8) void {
-        // If the path came from our arena, freeing it here is wrong — the
-        // arena owns it. Only free if the path was allocated by `allocator`
-        // (i.e. claude_data_path wasn't set in the config).
         if (self.claude_data_path == null) allocator.free(path);
+    }
+
+    // Returns the path to the on-disk state file used for persistence across
+    // daemon restarts. Caller owns the returned slice unless state_file is set
+    // in config (arena-owned). Use freeStateFilePath to clean up.
+    pub fn getStateFilePath(self: *const Config, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.state_file) |p| return p;
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+        return std.fs.path.join(allocator, &.{ home, ".cache", "ctm", "state.jsonl" });
+    }
+
+    pub fn freeStateFilePath(self: *const Config, allocator: std.mem.Allocator, path: []const u8) void {
+        if (self.state_file == null) allocator.free(path);
     }
 };

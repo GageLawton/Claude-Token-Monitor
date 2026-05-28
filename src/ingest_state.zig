@@ -1,11 +1,28 @@
 // Thread-safe in-memory store for usage entries. Used both by the Pi's HTTP
 // ingest endpoint and by the local-mode daemon (which feeds it via Watcher).
+//
+// Optional disk persistence: call enablePersistence(path) after init.
+// Accepted entries are appended to the file; on startup the file is loaded
+// (with age-filtering) so token history survives daemon restarts and reboots.
 
 const std = @import("std");
 const usage = @import("usage_reader.zig");
 const UsageEntry = usage.UsageEntry;
 const parseEntryFromLine = usage.parseEntryFromLine;
 const ParseOptions = usage.ParseOptions;
+const DEFAULT_MAX_AGE_SECONDS = usage.DEFAULT_MAX_AGE_SECONDS;
+
+// Compact on-disk format. Avoids an ISO-8601 serializer by storing Unix seconds.
+const PersistedLine = struct {
+    ts: i64,
+    sid: []const u8,
+    uuid: []const u8,
+    in: u64 = 0,
+    out: u64 = 0,
+    cc: u64 = 0,
+    cr: u64 = 0,
+    cost: f64 = 0,
+};
 
 pub const IngestState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -13,6 +30,7 @@ pub const IngestState = struct {
     entries: std.ArrayList(UsageEntry),
     seen_uuids: std.StringHashMap(void),
     last_updated_s: i64 = 0,
+    persist_path: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) IngestState {
         return .{
@@ -28,6 +46,20 @@ pub const IngestState = struct {
         var it = self.seen_uuids.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.seen_uuids.deinit();
+    }
+
+    // Enable disk persistence. Loads any surviving entries from `path` first
+    // (age-filtered so old entries are discarded), then appends every newly
+    // accepted entry to the file going forward.
+    pub fn enablePersistence(self: *IngestState, path: []const u8) void {
+        self.persist_path = path;
+        // Ensure the parent directory exists.
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch {};
+        }
+        self.loadFromFile(path) catch |err| {
+            std.log.warn("state: could not load {s}: {}", .{ path, err });
+        };
     }
 
     // Adds raw JSONL lines. Drops duplicates and entries older than
@@ -67,12 +99,10 @@ pub const IngestState = struct {
                 continue;
             };
             self.entries.append(entry) catch {
-                // The uuid is already in the map; leaving it there is harmless
-                // because the entry is gone — the worst case is rejecting a
-                // legitimate retry of the same uuid. Acceptable.
                 entry.deinit(self.allocator);
                 continue;
             };
+            if (self.persist_path) |p| self.appendEntryToDisk(p, entry);
             added += 1;
         }
 
@@ -81,7 +111,6 @@ pub const IngestState = struct {
     }
 
     // Returns a snapshot of all entries allocated on `allocator`.
-    // Caller owns the returned slice and each entry's strings.
     pub fn snapshot(self: *IngestState, allocator: std.mem.Allocator) ![]UsageEntry {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -122,5 +151,108 @@ pub const IngestState = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.entries.items.len;
+    }
+
+    pub fn lastUpdatedS(self: *IngestState) i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.last_updated_s;
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    // Append one entry to the persist file. Called under mutex; errors are
+    // silently dropped so a disk issue never breaks the in-memory store.
+    fn appendEntryToDisk(self: *IngestState, path: []const u8, entry: UsageEntry) void {
+        _ = self;
+        const file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch
+            std.fs.createFileAbsolute(path, .{}) catch return;
+        defer file.close();
+        file.seekFromEnd(0) catch return;
+
+        var buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf,
+            "{{\"ts\":{d},\"sid\":\"{s}\",\"uuid\":\"{s}\",\"in\":{d},\"out\":{d},\"cc\":{d},\"cr\":{d},\"cost\":{d:.8}}}\n",
+            .{
+                entry.timestamp_s,
+                entry.session_id,
+                entry.uuid,
+                entry.input_tokens,
+                entry.output_tokens,
+                entry.cache_create_tokens,
+                entry.cache_read_tokens,
+                entry.cost_usd,
+            },
+        ) catch return;
+        file.writeAll(line) catch {};
+    }
+
+    // Read the persist file, age-filter, and populate entries/seen_uuids.
+    // Must NOT be called while the mutex is held.
+    fn loadFromFile(self: *IngestState, path: []const u8) !void {
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer file.close();
+
+        const now = std.time.timestamp();
+        const cutoff = now - DEFAULT_MAX_AGE_SECONDS;
+
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var line_buf = std.ArrayList(u8).init(self.allocator);
+        defer line_buf.deinit();
+
+        var loaded: u32 = 0;
+        while (true) {
+            line_buf.clearRetainingCapacity();
+            buf_reader.reader().streamUntilDelimiter(line_buf.writer(), '\n', null) catch |err| {
+                if (err == error.EndOfStream) {
+                    if (line_buf.items.len == 0) break;
+                } else break;
+            };
+            const trimmed = std.mem.trim(u8, line_buf.items, " \t\r");
+            if (trimmed.len == 0) continue;
+
+            const parsed = std.json.parseFromSlice(PersistedLine, self.allocator, trimmed, .{
+                .ignore_unknown_fields = true,
+            }) catch continue;
+            defer parsed.deinit();
+            const pl = parsed.value;
+
+            if (pl.ts < cutoff) continue;
+            if (self.seen_uuids.contains(pl.uuid)) continue;
+
+            const entry = UsageEntry{
+                .timestamp_s = pl.ts,
+                .session_id = self.allocator.dupe(u8, pl.sid) catch continue,
+                .uuid = self.allocator.dupe(u8, pl.uuid) catch continue,
+                .input_tokens = pl.in,
+                .output_tokens = pl.out,
+                .cache_create_tokens = pl.cc,
+                .cache_read_tokens = pl.cr,
+                .cost_usd = pl.cost,
+            };
+
+            const key_copy = self.allocator.dupe(u8, entry.uuid) catch {
+                entry.deinit(self.allocator);
+                continue;
+            };
+            self.seen_uuids.put(key_copy, {}) catch {
+                self.allocator.free(key_copy);
+                entry.deinit(self.allocator);
+                continue;
+            };
+            self.entries.append(entry) catch {
+                entry.deinit(self.allocator);
+                continue;
+            };
+            loaded += 1;
+        }
+
+        if (loaded > 0) {
+            self.last_updated_s = std.time.timestamp();
+            std.log.info("state: restored {d} entries from {s}", .{ loaded, path });
+        }
     }
 };

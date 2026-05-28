@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ctm.agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Replace with the actual path to your ctm-agent binary -->
+    <string>/usr/local/bin/ctm-agent</string>
+    <!-- Optionally pass a config file -->
+    <!-- <string>--config</string> -->
+    <!-- <string>/Users/YOUR_USERNAME/.config/ctm/agent.json</string> -->
+  </array>
+
+  <!-- Keep the agent running; relaunch if it exits -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start automatically when you log in -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Replace YOUR_USERNAME with your macOS username -->
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/Library/Logs/ctm-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/Library/Logs/ctm-agent.log</string>
+
+  <!-- Minimum seconds between restarts (avoids tight crash loops) -->
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>

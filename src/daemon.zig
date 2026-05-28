@@ -66,6 +66,13 @@ fn runIngestMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs
     var state = IngestState.init(allocator);
     defer state.deinit();
 
+    const state_path = config.getStateFilePath(allocator) catch null;
+    defer if (state_path) |p| config.freeStateFilePath(allocator, p);
+    if (state_path) |p| {
+        state.enablePersistence(p);
+        logInfo(log_file, "state persistence: {s}", .{p});
+    }
+
     var thread_args = ServerThreadArgs{
         .allocator = allocator,
         .state = &state,
@@ -98,6 +105,13 @@ const IngestCtx = struct {
 fn runLocalMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs.File) !void {
     var state = IngestState.init(allocator);
     defer state.deinit();
+
+    const state_path = config.getStateFilePath(allocator) catch null;
+    defer if (state_path) |p| config.freeStateFilePath(allocator, p);
+    if (state_path) |p| {
+        state.enablePersistence(p);
+        logInfo(log_file, "state persistence: {s}", .{p});
+    }
 
     const data_path = try config.getClaudeDataPath(allocator);
     defer config.freeClaudeDataPath(allocator, data_path);
