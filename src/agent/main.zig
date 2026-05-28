@@ -9,7 +9,7 @@ const AgentConfig = @import("../../src/config.zig").AgentConfig;
 const Watcher = @import("watcher").Watcher;
 const shipper = @import("shipper.zig");
 
-const Mode = enum { run, ping, install_launchd, uninstall_launchd, help };
+const Mode = enum { run, status, ping, install_launchd, uninstall_launchd, help };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -28,6 +28,8 @@ pub fn main() !void {
         if ((std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) and i + 1 < args.len) {
             i += 1;
             config_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--status") or std.mem.eql(u8, arg, "-s")) {
+            mode = .status;
         } else if (std.mem.eql(u8, arg, "--ping")) {
             mode = .ping;
         } else if (std.mem.eql(u8, arg, "--install-launchd")) {
@@ -49,6 +51,7 @@ pub fn main() !void {
 
     switch (mode) {
         .run => try runAgent(allocator, cfg),
+        .status => try runStatus(allocator, cfg),
         .ping => try runPing(allocator, cfg),
         .install_launchd => try installLaunchd(allocator, config_path),
         .uninstall_launchd => try uninstallLaunchd(allocator),
@@ -102,6 +105,60 @@ fn resolveProjectsPath(allocator: std.mem.Allocator, cfg: AgentConfig) ![]const 
     return std.fs.path.join(allocator, &.{ home, ".config", "claude", "projects" });
 }
 
+// ── Status file ───────────────────────────────────────────────────────────────
+//
+// Written atomically after each successful ship so --status can read it
+// without IPC or a running agent.
+
+const StatusFile = struct {
+    pid: u32,
+    start_s: i64,
+    last_ship_s: i64,
+    total_shipped: u64,
+    spool_lines: u64,
+};
+
+fn statusFilePath(allocator: std.mem.Allocator) ?[]const u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    const p = std.fs.path.join(allocator, &.{ home, ".cache", "ctm", "agent-status.json" }) catch return null;
+    if (std.fs.path.dirname(p)) |dir| std.fs.makeDirAbsolute(dir) catch {};
+    return p;
+}
+
+fn writeStatusFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    start_s: i64,
+    total_shipped: u64,
+    spool_path: []const u8,
+) void {
+    const pid: u32 = @intCast(std.c.getpid());
+    const spool_lines = countSpoolLines(allocator, spool_path);
+
+    const json = std.fmt.allocPrint(allocator,
+        "{{\"pid\":{d},\"start_s\":{d},\"last_ship_s\":{d},\"total_shipped\":{d},\"spool_lines\":{d}}}\n",
+        .{ pid, start_s, std.time.timestamp(), total_shipped, spool_lines },
+    ) catch return;
+    defer allocator.free(json);
+
+    // Atomic write via temp file + rename.
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return;
+    const f = std.fs.createFileAbsolute(tmp, .{}) catch return;
+    f.writeAll(json) catch { f.close(); return; };
+    f.close();
+    std.fs.renameAbsolute(tmp, path) catch {};
+}
+
+fn countSpoolLines(allocator: std.mem.Allocator, spool_path: []const u8) u64 {
+    if (spool_path.len == 0) return 0;
+    const file = std.fs.openFileAbsolute(spool_path, .{}) catch return 0;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return 0;
+    defer allocator.free(content);
+    return @intCast(std.mem.count(u8, content, "\n"));
+}
+
 // ── Spool: buffer failed shipments on disk, retry with exponential backoff ────
 
 const Spool = struct {
@@ -110,7 +167,6 @@ const Spool = struct {
     fail_count: u32 = 0,
     next_retry_ns: i128 = 0,
 
-    // Backoff schedule (ms): 2s, 4s, 8s, 16s, 32s, 60s.
     const BACKOFFS_MS = [_]i128{ 2_000, 4_000, 8_000, 16_000, 32_000, 60_000 };
 
     fn hasData(self: *const Spool) bool {
@@ -121,7 +177,6 @@ const Spool = struct {
         return stat.size > 0;
     }
 
-    // Appends lines to the spool file (creates it if needed). Silently drops errors.
     fn append(self: *const Spool, lines: []const []const u8) void {
         if (self.path.len == 0 or lines.len == 0) return;
         const file = std.fs.openFileAbsolute(self.path, .{ .mode = .write_only }) catch
@@ -135,7 +190,6 @@ const Spool = struct {
         std.log.warn("agent: spooled {d} lines to {s}", .{ lines.len, self.path });
     }
 
-    // Reads all spooled lines into out, allocated with alloc. Silently drops errors.
     fn readLines(self: *const Spool, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
         if (self.path.len == 0) return;
         const file = std.fs.openFileAbsolute(self.path, .{}) catch return;
@@ -203,10 +257,16 @@ fn runAgent(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
     };
     defer if (maybe_spool_path) |p| allocator.free(p);
 
+    const status_path = statusFilePath(allocator);
+    defer if (status_path) |p| allocator.free(p);
+
     var spool = Spool{
         .path = maybe_spool_path orelse "",
         .allocator = allocator,
     };
+
+    const start_s = std.time.timestamp();
+    var total_shipped: u64 = 0;
 
     while (true) {
         std.time.sleep(std.time.ns_per_ms * cfg.poll_interval_ms);
@@ -222,13 +282,11 @@ fn runAgent(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
 
         if (!has_new and !has_spool) continue;
 
-        // Backoff in effect — just spool the new data and wait.
         if (has_spool and !spool.shouldRetry()) {
             if (has_new) spool.append(new_data.lines.items);
             continue;
         }
 
-        // Build combined line list: spooled backlog + fresh lines.
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -243,7 +301,7 @@ fn runAgent(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
         if (backlog > 0) {
             std.log.info("agent: shipping {d} lines ({d} from spool)", .{ combined.items.len, backlog });
         } else {
-            std.log.info("agent: shipping {d} new lines", .{ combined.items.len });
+            std.log.info("agent: shipping {d} new lines", .{combined.items.len});
         }
 
         shipper.ship(allocator, ship_cfg, combined.items) catch |err| {
@@ -253,8 +311,81 @@ fn runAgent(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
             continue;
         };
 
+        total_shipped += combined.items.len;
         spool.onSuccess();
+
+        if (status_path) |sp| {
+            writeStatusFile(allocator, sp, start_s, total_shipped, spool.path);
+        }
     }
+}
+
+// ── --status ─────────────────────────────────────────────────────────────────
+
+fn runStatus(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
+    const stdout = std.io.getStdOut().writer();
+    const now = std.time.timestamp();
+
+    try stdout.print("\n  ctm-agent status\n\n", .{});
+
+    // Read the status file written by the running agent.
+    const sp = statusFilePath(allocator);
+    defer if (sp) |p| allocator.free(p);
+
+    if (sp) |path| {
+        const content = std.fs.openFileAbsolute(path, .{}) catch null;
+        if (content) |f| {
+            defer f.close();
+            const raw = f.readToEndAlloc(allocator, 4096) catch null;
+            if (raw) |bytes| {
+                defer allocator.free(bytes);
+                const parsed = std.json.parseFromSlice(StatusFile, allocator, bytes, .{
+                    .ignore_unknown_fields = true,
+                }) catch null;
+                if (parsed) |p| {
+                    defer p.deinit();
+                    const s = p.value;
+                    const uptime_s = now - s.start_s;
+                    const last_ship_s = now - s.last_ship_s;
+                    try stdout.print("  Agent PID:   {d} (uptime {d}h {d}m)\n", .{
+                        s.pid, uptime_s / 3600, (uptime_s % 3600) / 60,
+                    });
+                    try stdout.print("  Last ship:   {d}m ago  ({d} total lines)\n", .{
+                        last_ship_s / 60, s.total_shipped,
+                    });
+                    try stdout.print("  Spool:       {d} lines pending\n", .{s.spool_lines});
+                }
+            }
+        } else {
+            try stdout.print("  Agent:       not running (no status file)\n", .{});
+        }
+    }
+
+    // Ping Pi for live status.
+    try stdout.print("\n  Pi ({s}:{d}):\n", .{ cfg.pi_host, cfg.pi_port });
+    const url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/health", .{ cfg.pi_host, cfg.pi_port });
+    defer allocator.free(url);
+
+    const argv = [_][]const u8{
+        "curl", "--silent", "--show-error", "--connect-timeout", "5", "--max-time", "8", url,
+    };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    const out = try child.stdout.?.readToEndAlloc(allocator, 4096);
+    defer allocator.free(out);
+    const err_out = try child.stderr.?.readToEndAlloc(allocator, 1024);
+    defer allocator.free(err_out);
+    const term = try child.wait();
+    const code: u8 = switch (term) { .Exited => |c| c, else => 1 };
+
+    if (code == 0) {
+        try stdout.print("  {s}\n", .{std.mem.trim(u8, out, " \t\r\n")});
+    } else {
+        try stdout.print("  unreachable — {s}\n", .{std.mem.trim(u8, err_out, " \t\r\n")});
+    }
+    try stdout.print("\n", .{});
 }
 
 // ── --ping ────────────────────────────────────────────────────────────────────
@@ -267,14 +398,8 @@ fn runPing(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
     try stdout.print("Pinging {s} ...\n", .{url});
 
     const argv = [_][]const u8{
-        "curl",
-        "--silent",
-        "--show-error",
-        "--connect-timeout", "5",
-        "--max-time",        "10",
-        url,
+        "curl", "--silent", "--show-error", "--connect-timeout", "5", "--max-time", "10", url,
     };
-
     var child = std.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -286,18 +411,13 @@ fn runPing(allocator: std.mem.Allocator, cfg: AgentConfig) !void {
     defer allocator.free(err_out);
 
     const term = try child.wait();
-    const code: u8 = switch (term) {
-        .Exited => |c| c,
-        else => 1,
-    };
+    const code: u8 = switch (term) { .Exited => |c| c, else => 1 };
 
     if (code == 0) {
         try stdout.print("Pi is reachable:\n  {s}\n", .{std.mem.trim(u8, out, " \t\r\n")});
     } else {
         try stdout.print("Could not reach Pi at {s}:{d}\n", .{ cfg.pi_host, cfg.pi_port });
-        if (err_out.len > 0) {
-            try stdout.print("  {s}\n", .{std.mem.trim(u8, err_out, " \t\r\n")});
-        }
+        if (err_out.len > 0) try stdout.print("  {s}\n", .{std.mem.trim(u8, err_out, " \t\r\n")});
         std.process.exit(1);
     }
 }
@@ -328,8 +448,7 @@ fn installLaunchd(allocator: std.mem.Allocator, config_path: ?[]const u8) !void 
     try args_xml.writer().print("    <string>{s}</string>\n", .{exe_path});
     if (config_path) |cp| {
         try args_xml.writer().print(
-            "    <string>--config</string>\n    <string>{s}</string>\n",
-            .{cp},
+            "    <string>--config</string>\n    <string>{s}</string>\n", .{cp},
         );
     }
 
@@ -377,8 +496,7 @@ fn installLaunchd(allocator: std.mem.Allocator, config_path: ?[]const u8) !void 
 fn uninstallLaunchd(allocator: std.mem.Allocator) !void {
     const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
     const plist_path = try std.fs.path.join(
-        allocator,
-        &.{ home, "Library", "LaunchAgents", "com.ctm.agent.plist" },
+        allocator, &.{ home, "Library", "LaunchAgents", "com.ctm.agent.plist" },
     );
     defer allocator.free(plist_path);
 
@@ -403,6 +521,7 @@ fn printHelp() void {
         \\
         \\OPTIONS
         \\  -c, --config PATH       Use a specific config file
+        \\  -s, --status            Show agent health, spool size, and Pi reachability
         \\      --ping              Check Pi connectivity (GET /health)
         \\      --install-launchd   Install as macOS launch agent (auto-start)
         \\      --uninstall-launchd Remove launch agent

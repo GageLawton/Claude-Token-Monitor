@@ -1,0 +1,18 @@
+# logrotate config for Claude Token Monitor daemon log.
+#
+# Install: copy to /etc/logrotate.d/ctm  (or ~/.config/logrotate.d/ctm for user installs)
+# Alternatively, use the built-in rotation by setting log_max_size_mb in config.json.
+#
+# Default log path: whatever log_file is set to in ~/.config/ctm/config.json.
+# Replace the path below if you use a custom log_file location.
+
+/var/log/ctm.log /home/*/.ctm.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    # copytruncate: rotate without needing to send a signal, since ctm has
+    # the file open and re-opens it each log line via seekFromEnd.
+    copytruncate
+}
