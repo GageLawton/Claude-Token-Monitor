@@ -176,19 +176,23 @@ pub const Watcher = struct {
         var line_buf = std.ArrayList(u8).init(self.allocator);
         defer line_buf.deinit();
 
+        // Track committed bytes manually so a partial final line (no trailing
+        // newline yet) is not counted — re-read it once the write completes.
+        var committed_offset = state.offset;
         while (true) {
             line_buf.clearRetainingCapacity();
             buf_reader.reader().streamUntilDelimiter(line_buf.writer(), '\n', null) catch |err| {
-                if (err == error.EndOfStream) break;
+                if (err == error.EndOfStream) break; // partial line — don't advance
                 return err;
             };
+            committed_offset += @as(u64, @intCast(line_buf.items.len)) + 1; // +1 for '\n'
             const trimmed = std.mem.trim(u8, line_buf.items, " \t\r");
             if (trimmed.len == 0) continue;
             const owned = try self.allocator.dupe(u8, trimmed);
             try out.lines.append(owned);
         }
 
-        state.offset = try file.getPos();
+        state.offset = committed_offset;
         state.mtime_ns = meta.mtime;
     }
 };

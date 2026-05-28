@@ -55,6 +55,10 @@ keeping RSS well under 8 MB.
 - **No login required** — piggybacks on Claude Code's existing session files
 - **Multi-plan support** — Pro, Max 5x, Max 20x
 - **Raspberry Pi friendly** — single static binary, systemd unit included
+- **State persistence** — token history survives Pi reboots and daemon restarts
+- **Spool-and-retry** — `ctm-agent` buffers failed shipments and retries with exponential backoff (2s–60s) so no data is lost during Pi downtime
+- **macOS auto-start** — `ctm-agent --install-launchd` registers a launch agent (KeepAlive)
+- **Connectivity check** — `ctm-agent --ping` hits the Pi's `/health` endpoint before a coding session
 - **Fully tested** — unit tests across every module, `kcov` coverage support
 
 ---
@@ -107,6 +111,7 @@ The resulting binary in `zig-out/bin/ctm` is fully static — copy it to the Pi 
 ctm              # live dashboard (Ctrl+C to exit)
 ctm --status     # one-shot status print
 ctm --daemon     # detach into background
+ctm --gen-secret # generate a 256-bit shared secret for Pi setup
 ctm --help       # show all options
 ```
 
@@ -155,9 +160,35 @@ Example (`config.example.json`):
     "password": "your-app-password",
     "from": "you@gmail.com",
     "to": "notify@youremail.com"
-  }
+  },
+
+  "ingest_server": {
+    "enabled": true,
+    "bind_host": "0.0.0.0",
+    "bind_port": 7373,
+    "shared_secret": "paste-output-of-ctm-gen-secret-here"
+  },
+
+  "state_file": "~/.cache/ctm/state.jsonl"
 }
 ```
+
+#### Generating a shared secret
+
+```bash
+ctm --gen-secret
+# → a4f8e2c1... (64 hex chars, 256 bits of entropy)
+```
+
+Use the same value for `ingest_server.shared_secret` on the Pi and `shared_secret`
+in `~/.config/ctm/agent.json` on the dev machine.
+
+#### State persistence
+
+The daemon persists accepted token entries to `state_file` (default:
+`~/.cache/ctm/state.jsonl`) so history survives reboots. The file uses a
+compact JSONL format and is age-filtered on load to match the 5-hour rolling
+window — it stays small indefinitely.
 
 ### Setting up Gmail notifications
 
@@ -220,22 +251,40 @@ cp config.example.agent.json ~/.config/ctm/agent.json
 nano ~/.config/ctm/agent.json
 ```
 
-Run the agent (keep it running in the background):
+### 3. Verify connectivity
 
 ```bash
-ctm-agent &
-# or add to your shell profile / launchd / systemd user session
+# Check the Pi is reachable before your first session
+ctm-agent --ping
+# → Pi is reachable:
+#     {"status":"ok","entries":0,"last_ingest_s":0,"uptime_s":12}
 ```
 
-### 3. Verify
+### 4. Auto-start on login (macOS)
 
 ```bash
-# On dev machine — should see "shipping N new lines"
-ctm-agent --help
+# Installs ~/Library/LaunchAgents/com.ctm.agent.plist and loads it
+ctm-agent --install-launchd
 
-# On Pi — watch the log
-tail -f ~/.ctm.log
+# Check logs
+tail -f ~/Library/Logs/ctm-agent.log
+
+# Remove when no longer needed
+ctm-agent --uninstall-launchd
 ```
+
+On Linux, use the included systemd user unit or add `ctm-agent &` to your
+shell profile.
+
+### (Optional) Claude Code hook
+
+The hook in `hooks/ctm-session-start.sh` pings the Pi at the start of every
+Claude Code session so you know whether data is being shipped live or spooled
+for later retry. If the Pi is unreachable, `ctm-agent` automatically spools
+data to `~/.cache/ctm/spool.jsonl` and ships it when the Pi comes back.
+
+See [Claude Code hooks docs](https://docs.anthropic.com/en/docs/claude-code/hooks)
+for how to install it.
 
 ### Finding your Pi's hostname
 
@@ -272,21 +321,23 @@ It will auto-start on boot and restart if it crashes.
 
 ```
 ├── src/
-│   ├── main.zig            CLI entry point
+│   ├── main.zig            CLI entry point (ctm)
 │   ├── config.zig          JSON config + plan definitions
 │   ├── usage_reader.zig    JSONL parser for ~/.claude/projects/
 │   ├── session_tracker.zig 5-hour window math, burn rate, summaries
 │   ├── dashboard.zig       Live terminal UI
 │   ├── email.zig           SMTP notifications
-│   ├── daemon.zig          Background daemon mode
+│   ├── daemon.zig          Background daemon mode + monitor loop
 │   ├── watcher.zig         inotify + stat-poll file watcher (shared)
-│   ├── ingest_state.zig    Thread-safe in-memory entry store
-│   ├── ingest_server.zig   HTTP endpoint (Pi receives pushed data)
+│   ├── ingest_state.zig    Thread-safe entry store with disk persistence
+│   ├── ingest_server.zig   HTTP server on Pi (/ingest, /health)
 │   └── agent/
 │       ├── main.zig        ctm-agent entry point (dev machine)
 │       └── shipper.zig     HTTP POST to Pi ingest endpoint
 ├── tests/                  Unit tests (one file per source module)
-├── systemd/                Service unit template
+├── systemd/                systemd service unit template (Pi)
+├── launch-agents/          macOS launchd plist template (dev machine)
+├── hooks/                  Claude Code hook examples
 ├── scripts/                Install + coverage helpers
 └── build.zig               Zig build & test runner
 ```
