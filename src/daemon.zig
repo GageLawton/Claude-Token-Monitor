@@ -1,18 +1,25 @@
-// Background daemon mode: monitors token usage and sends email alerts.
-// Two data sources are supported:
-//   local mode  — reads ~/.claude/projects/*.jsonl directly (dev machine)
-//   ingest mode — receives data pushed by ctm-agent (Pi Zero deployment)
+// Background daemon: monitors token usage and sends email alerts.
+//
+// Local mode  — Watcher tails ~/.claude/projects/*.jsonl on this machine.
+//               Uses inotify on Linux for ~0% idle CPU; stat-polls elsewhere.
+// Ingest mode — HTTP server receives data pushed by ctm-agent over the LAN.
 
 const std = @import("std");
 const Config = @import("config.zig").Config;
-const UsageReader = @import("usage_reader.zig").UsageReader;
+const usage = @import("usage_reader.zig");
+const UsageEntry = usage.UsageEntry;
 const SessionTracker = @import("session_tracker.zig").SessionTracker;
 const WindowStats = @import("session_tracker.zig").WindowStats;
 const IngestState = @import("ingest_state.zig").IngestState;
 const IngestServer = @import("ingest_server.zig").Server;
+const Watcher = @import("watcher.zig").Watcher;
 const email = @import("email.zig");
 
 const PID_FILE = "/var/run/ctm.pid";
+
+// Cap entries kept in memory. Matches usage_reader.DEFAULT_MAX_AGE_SECONDS
+// plus an extra hour of slack for delayed pushes.
+const PRUNE_CUTOFF_SECONDS: i64 = usage.DEFAULT_MAX_AGE_SECONDS + 60 * 60;
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     try daemonize();
@@ -36,7 +43,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !void {
     }
 }
 
-// ── Ingest mode (Pi Zero): receive data from ctm-agent over HTTP ─────────────
+// ── Ingest mode (Pi receives pushed data) ────────────────────────────────────
 
 const ServerThreadArgs = struct {
     allocator: std.mem.Allocator,
@@ -71,42 +78,80 @@ fn runIngestMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs
         config.ingest_server.bind_host, config.ingest_server.bind_port,
     });
 
-    try monitorLoop(allocator, config, log_file, struct {
-        state: *IngestState,
-        alloc: std.mem.Allocator,
-
-        pub fn getEntries(self: @This(), arena: std.mem.Allocator) ![]const @import("usage_reader.zig").UsageEntry {
-            _ = arena;
-            return self.state.snapshot(self.alloc);
-        }
-    }{ .state = &state, .alloc = allocator });
+    const ctx = IngestCtx{ .state = &state };
+    try monitorLoop(allocator, config, log_file, IngestCtx, ctx);
 }
 
-// ── Local mode (dev machine): read JSONL files directly ──────────────────────
+const IngestCtx = struct {
+    state: *IngestState,
+
+    pub fn tick(self: IngestCtx, timeout_s: u32, alloc: std.mem.Allocator) ![]UsageEntry {
+        // Sleep, then snapshot. Server thread fills state asynchronously.
+        std.time.sleep(std.time.ns_per_s * timeout_s);
+        self.state.pruneOlderThan(std.time.timestamp() - PRUNE_CUTOFF_SECONDS);
+        return self.state.snapshot(alloc);
+    }
+};
+
+// ── Local mode (read JSONL files on this machine) ────────────────────────────
 
 fn runLocalMode(allocator: std.mem.Allocator, config: Config, log_file: ?std.fs.File) !void {
+    var state = IngestState.init(allocator);
+    defer state.deinit();
+
     const data_path = try config.getClaudeDataPath(allocator);
-    defer if (config.claude_data_path == null) allocator.free(data_path);
+    defer config.freeClaudeDataPath(allocator, data_path);
 
-    logInfo(log_file, "local mode: reading {s}", .{data_path});
+    logInfo(log_file, "local mode: watching {s}", .{data_path});
 
-    try monitorLoop(allocator, config, log_file, struct {
-        path: []const u8,
+    var watcher = Watcher.init(allocator, data_path);
+    defer watcher.deinit();
 
-        pub fn getEntries(self: @This(), arena: std.mem.Allocator) ![]const @import("usage_reader.zig").UsageEntry {
-            var reader = UsageReader.init(arena, self.path);
-            return reader.readAll();
-        }
-    }{ .path = data_path });
+    if (watcher.inotify_fd >= 0) {
+        logInfo(log_file, "local mode: inotify enabled (idle CPU ~0%)", .{});
+    } else {
+        logInfo(log_file, "local mode: using stat-polling fallback", .{});
+    }
+
+    const ctx = LocalCtx{ .state = &state, .watcher = &watcher };
+    try monitorLoop(allocator, config, log_file, LocalCtx, ctx);
 }
 
-// ── Shared monitoring loop ────────────────────────────────────────────────────
+const LocalCtx = struct {
+    state: *IngestState,
+    watcher: *Watcher,
+
+    pub fn tick(self: LocalCtx, timeout_s: u32, alloc: std.mem.Allocator) ![]UsageEntry {
+        // Wake on inotify event or after timeout_s, whichever first.
+        const timeout_ms: i32 = @intCast(@min(@as(u32, std.math.maxInt(i32) / 1000), timeout_s) * 1000);
+        self.watcher.waitForEvent(timeout_ms);
+
+        // Drain any new lines into state.
+        var new_data = self.watcher.poll() catch |err| {
+            std.log.warn("watcher.poll: {}", .{err});
+            return self.state.snapshot(alloc);
+        };
+        defer new_data.deinit();
+
+        if (new_data.lines.items.len > 0) {
+            _ = self.state.addLines(new_data.lines.items) catch |err| {
+                std.log.warn("state.addLines: {}", .{err});
+            };
+        }
+
+        self.state.pruneOlderThan(std.time.timestamp() - PRUNE_CUTOFF_SECONDS);
+        return self.state.snapshot(alloc);
+    }
+};
+
+// ── Shared monitoring loop ───────────────────────────────────────────────────
 
 fn monitorLoop(
     allocator: std.mem.Allocator,
     config: Config,
     log_file: ?std.fs.File,
-    source: anytype,
+    comptime CtxT: type,
+    ctx: CtxT,
 ) !void {
     var prev_stats: ?WindowStats = null;
     var notified_limit = false;
@@ -117,9 +162,8 @@ fn monitorLoop(
         defer arena.deinit();
         const a = arena.allocator();
 
-        const entries = source.getEntries(a) catch {
-            logInfo(log_file, "failed to read usage data", .{});
-            std.time.sleep(std.time.ns_per_s * config.refresh_interval_seconds);
+        const entries = ctx.tick(config.refresh_interval_seconds, a) catch {
+            logInfo(log_file, "tick failed; retrying", .{});
             continue;
         };
 
@@ -157,32 +201,21 @@ fn monitorLoop(
             stats.tokens_used, stats.token_limit, pct, stats.secondsUntilReset(),
         });
 
-        prev_stats = WindowStats{
-            .tokens_used = stats.tokens_used,
-            .token_limit = stats.token_limit,
-            .window_cost_usd = stats.window_cost_usd,
-            .window_start_s = stats.window_start_s,
-            .reset_at_s = stats.reset_at_s,
-            .burn_rate_per_hour = stats.burn_rate_per_hour,
-            .entry_count = stats.entry_count,
-            .is_at_limit = stats.is_at_limit,
-        };
-
-        std.time.sleep(std.time.ns_per_s * config.refresh_interval_seconds);
+        prev_stats = stats;
     }
 }
 
+// ── Process management ───────────────────────────────────────────────────────
+
 fn daemonize() !void {
-    // Double-fork to fully detach from terminal.
     const child1 = try std.posix.fork();
-    if (child1 > 0) std.process.exit(0); // parent exits
+    if (child1 > 0) std.process.exit(0);
 
     _ = try std.posix.setsid();
 
     const child2 = try std.posix.fork();
-    if (child2 > 0) std.process.exit(0); // first child exits
+    if (child2 > 0) std.process.exit(0);
 
-    // Redirect stdin/stdout/stderr to /dev/null
     const null_fd = try std.posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
     defer std.posix.close(null_fd);
     try std.posix.dup2(null_fd, std.posix.STDIN_FILENO);
@@ -196,7 +229,6 @@ fn writePidFile() !void {
     const pid_str = std.fmt.bufPrint(&buf, "{d}\n", .{pid}) catch return;
 
     const f = std.fs.createFileAbsolute(PID_FILE, .{}) catch {
-        // Fall back to home dir if /var/run isn't writable (non-root)
         const home = std.posix.getenv("HOME") orelse return;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/.ctm.pid", .{home}) catch return;

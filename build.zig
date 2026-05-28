@@ -27,9 +27,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Agent imports config + usage_reader from the main src tree.
+    // Agent imports config and watcher from the main src tree.
     agent_exe.root_module.addAnonymousImport("config", .{
         .root_source_file = b.path("src/config.zig"),
+    });
+    agent_exe.root_module.addAnonymousImport("watcher", .{
+        .root_source_file = b.path("src/watcher.zig"),
     });
     b.installArtifact(agent_exe);
 

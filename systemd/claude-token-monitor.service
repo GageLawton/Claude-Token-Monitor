@@ -5,13 +5,20 @@ After=network.target
 
 [Service]
 Type=forking
-# Replace with the actual user who runs Claude Code
 User=%i
 ExecStart=/usr/local/bin/ctm --daemon --config /home/%i/.config/ctm/config.json
 Restart=on-failure
 RestartSec=30
-# Give it access to the user's home directory for ~/.claude/projects
 Environment=HOME=/home/%i
+
+# Resource limits — tuned for Pi Zero (512 MB RAM, single ARM11 core).
+# ctm idles at ~0% CPU (inotify-driven) and <8 MB RSS; these give headroom
+# while ensuring a runaway bug cannot starve other processes.
+MemoryMax=32M
+CPUQuota=20%
+Nice=10
+OOMScoreAdjust=200
+TasksMax=8
 
 [Install]
 WantedBy=multi-user.target

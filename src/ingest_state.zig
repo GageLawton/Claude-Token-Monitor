@@ -1,9 +1,11 @@
-// Thread-safe in-memory store for usage entries pushed by ctm-agent.
-// Replaces local JSONL file reading when running in ingest (Pi) mode.
+// Thread-safe in-memory store for usage entries. Used both by the Pi's HTTP
+// ingest endpoint and by the local-mode daemon (which feeds it via Watcher).
 
 const std = @import("std");
-const UsageEntry = @import("usage_reader.zig").UsageEntry;
-const parseEntryFromLine = @import("usage_reader.zig").parseEntryFromLine;
+const usage = @import("usage_reader.zig");
+const UsageEntry = usage.UsageEntry;
+const parseEntryFromLine = usage.parseEntryFromLine;
+const ParseOptions = usage.ParseOptions;
 
 pub const IngestState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -28,9 +30,17 @@ pub const IngestState = struct {
         self.seen_uuids.deinit();
     }
 
-    // Accepts a slice of raw JSONL lines sent by ctm-agent.
-    // Returns the number of new unique entries added.
+    // Adds raw JSONL lines. Drops duplicates and entries older than
+    // ParseOptions.max_age_seconds (default: 5h + 10min grace).
     pub fn addLines(self: *IngestState, lines: []const []const u8) !u32 {
+        return self.addLinesWithOptions(lines, .{});
+    }
+
+    pub fn addLinesWithOptions(
+        self: *IngestState,
+        lines: []const []const u8,
+        options: ParseOptions,
+    ) !u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -39,25 +49,27 @@ pub const IngestState = struct {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
 
-            const entry = parseEntryFromLine(self.allocator, trimmed) catch continue orelse continue;
+            const maybe_entry = parseEntryFromLine(self.allocator, trimmed, options) catch continue;
+            const entry = maybe_entry orelse continue;
 
             if (self.seen_uuids.contains(entry.uuid)) {
                 entry.deinit(self.allocator);
                 continue;
             }
 
-            self.seen_uuids.put(
-                self.allocator.dupe(u8, entry.uuid) catch {
-                    entry.deinit(self.allocator);
-                    continue;
-                },
-                {},
-            ) catch {
+            const key_copy = self.allocator.dupe(u8, entry.uuid) catch {
                 entry.deinit(self.allocator);
                 continue;
             };
-
+            self.seen_uuids.put(key_copy, {}) catch {
+                self.allocator.free(key_copy);
+                entry.deinit(self.allocator);
+                continue;
+            };
             self.entries.append(entry) catch {
+                // The uuid is already in the map; leaving it there is harmless
+                // because the entry is gone — the worst case is rejecting a
+                // legitimate retry of the same uuid. Acceptable.
                 entry.deinit(self.allocator);
                 continue;
             };
@@ -69,7 +81,7 @@ pub const IngestState = struct {
     }
 
     // Returns a snapshot of all entries allocated on `allocator`.
-    // Caller owns the returned slice and each entry's strings — call UsageEntry.deinit.
+    // Caller owns the returned slice and each entry's strings.
     pub fn snapshot(self: *IngestState, allocator: std.mem.Allocator) ![]UsageEntry {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -90,7 +102,7 @@ pub const IngestState = struct {
         return result.toOwnedSlice();
     }
 
-    // Drop entries older than cutoff_s to keep memory bounded on Pi Zero.
+    // Drop entries older than cutoff_s. Keeps memory bounded on Pi Zero.
     pub fn pruneOlderThan(self: *IngestState, cutoff_s: i64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -104,5 +116,11 @@ pub const IngestState = struct {
                 i += 1;
             }
         }
+    }
+
+    pub fn entryCount(self: *IngestState) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.entries.items.len;
     }
 };
