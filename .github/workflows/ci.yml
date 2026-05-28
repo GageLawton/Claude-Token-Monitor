@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**", "fix/**", "feat/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.13.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.13.0"
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build release binary (x86_64)
+        run: zig build -Doptimize=ReleaseSafe
+
+  cross-compile:
+    name: Cross-compile ARM targets
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-musl       # Pi 4/5 (64-bit)
+          - arm-linux-musleabihf     # Pi Zero / Pi 2-3 (32-bit ARMv6/v7)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.13.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.13.0"
+
+      - name: Cross-compile ctm for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
