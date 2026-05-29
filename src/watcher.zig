@@ -1,8 +1,9 @@
 // Filesystem watcher for ~/.claude/projects/**/*.jsonl.
 //
-// Two strategies are tried at init time:
-//   1. Linux inotify — event-driven, ~0% idle CPU. Used on Pi Zero / Linux.
-//   2. stat() polling — cross-platform fallback for macOS or kernels without inotify.
+// Three strategies tried in order at init time:
+//   1. Linux inotify    — event-driven, ~0% idle CPU. Used on Pi Zero / Linux.
+//   2. BSD/macOS kqueue — event-driven, ~0% idle CPU. Used on macOS dev machines.
+//   3. stat() polling   — cross-platform fallback for other platforms.
 //
 // Either way, only NEW bytes are read from each file (per-file offsets stored
 // across calls). The caller polls() to receive new lines, and may call
@@ -12,7 +13,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const is_linux = builtin.os.tag == .linux;
+const is_bsd = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+
 const linux = std.os.linux;
+
+// kqueue filter/flag constants (BSD <sys/event.h> — stable for decades).
+const KQ_EVFILT_VNODE: i16 = -4;
+const KQ_EV_ADD: u16 = 0x0001;
+const KQ_EV_CLEAR: u16 = 0x0020;
+const KQ_NOTE_WRITE: u32 = 0x00000002;
+const KQ_NOTE_EXTEND: u32 = 0x00000004;
 
 pub const NewData = struct {
     lines: std.ArrayList([]u8),
@@ -34,7 +47,9 @@ pub const Watcher = struct {
     projects_path: []const u8,
     file_states: std.StringHashMap(FileState),
 
-    inotify_fd: i32 = -1, // -1 means inotify unavailable
+    inotify_fd: i32 = -1,  // Linux inotify; -1 = unavailable
+    kqueue_fd: i32 = -1,   // BSD/macOS kqueue; -1 = unavailable
+    kqueue_dir_fd: i32 = -1, // directory fd kept open for the kqueue vnode watch
 
     pub fn init(allocator: std.mem.Allocator, projects_path: []const u8) Watcher {
         var w = Watcher{
@@ -44,6 +59,8 @@ pub const Watcher = struct {
         };
         if (is_linux) {
             w.tryInitInotify();
+        } else if (is_bsd) {
+            w.tryInitKqueue();
         }
         return w;
     }
@@ -53,24 +70,29 @@ pub const Watcher = struct {
             std.posix.close(self.inotify_fd);
             self.inotify_fd = -1;
         }
+        if (self.kqueue_dir_fd >= 0) {
+            std.posix.close(self.kqueue_dir_fd);
+            self.kqueue_dir_fd = -1;
+        }
+        if (self.kqueue_fd >= 0) {
+            std.posix.close(self.kqueue_fd);
+            self.kqueue_fd = -1;
+        }
         var it = self.file_states.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.file_states.deinit();
     }
 
+    // ── inotify (Linux) ───────────────────────────────────────────────────────
+
     fn tryInitInotify(self: *Watcher) void {
         if (!is_linux) return;
 
-        // inotify_init1 returns usize; negative-cast indicates error.
         const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
         const signed: isize = @bitCast(rc);
         if (signed < 0) return;
         self.inotify_fd = @intCast(signed);
 
-        // Add a watch on the projects root. We re-scan the tree on every event
-        // so per-subdir watches aren't required — root events suffice as a
-        // "something changed" hint. A periodic timeout in waitForEvent catches
-        // the case where IN_MODIFY on a file in a subdir wouldn't bubble up.
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{self.projects_path}) catch {
             std.posix.close(self.inotify_fd);
@@ -83,12 +105,57 @@ pub const Watcher = struct {
         if (wd_signed < 0) {
             std.posix.close(self.inotify_fd);
             self.inotify_fd = -1;
-            return;
         }
     }
 
+    // ── kqueue (macOS / BSD) ──────────────────────────────────────────────────
+
+    fn tryInitKqueue(self: *Watcher) void {
+        if (!is_bsd) return;
+
+        const kq = std.posix.kqueue() catch return;
+
+        // Open the projects directory for vnode watching.
+        // O_EVTONLY (0x8000) avoids preventing unmount on macOS; fall back to RDONLY.
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{self.projects_path}) catch {
+            std.posix.close(kq);
+            return;
+        };
+
+        const O_EVTONLY: u32 = if (builtin.os.tag == .macos) 0x8000 else 0;
+        const open_flags: std.posix.O = if (O_EVTONLY != 0)
+            @bitCast(O_EVTONLY)
+        else
+            .{ .ACCMODE = .RDONLY };
+
+        const dir_fd = std.posix.open(path_z, open_flags, 0) catch {
+            std.posix.close(kq);
+            return;
+        };
+
+        // Register a vnode watch for write/extend events.
+        var kev = std.posix.Kevent{
+            .ident = @intCast(dir_fd),
+            .filter = KQ_EVFILT_VNODE,
+            .flags = KQ_EV_ADD | KQ_EV_CLEAR,
+            .fflags = KQ_NOTE_WRITE | KQ_NOTE_EXTEND,
+            .data = 0,
+            .udata = 0,
+        };
+        _ = std.posix.kevent(kq, &.{kev}, &.{}, null) catch {
+            std.posix.close(dir_fd);
+            std.posix.close(kq);
+            return;
+        };
+
+        self.kqueue_fd = kq;
+        self.kqueue_dir_fd = dir_fd;
+    }
+
+    // ── Event waiting ─────────────────────────────────────────────────────────
+
     // Blocks until either a filesystem event arrives or `timeout_ms` elapses.
-    // On non-Linux (no inotify), this just sleeps for `timeout_ms`.
     pub fn waitForEvent(self: *Watcher, timeout_ms: i32) void {
         if (self.inotify_fd >= 0) {
             var pfd = [_]std.posix.pollfd{.{
@@ -104,11 +171,21 @@ pub const Watcher = struct {
                 if (n == 0) break;
                 if (n < drain_buf.len) break;
             }
+        } else if (self.kqueue_fd >= 0) {
+            const ms: u64 = @intCast(@max(timeout_ms, 0));
+            const ts = std.posix.timespec{
+                .tv_sec = @intCast(ms / 1000),
+                .tv_nsec = @intCast((ms % 1000) * 1_000_000),
+            };
+            var ev_out: [1]std.posix.Kevent = undefined;
+            _ = std.posix.kevent(self.kqueue_fd, &.{}, &ev_out, &ts) catch {};
         } else {
             const ns: u64 = @as(u64, @intCast(@max(timeout_ms, 0))) * std.time.ns_per_ms;
             std.time.sleep(ns);
         }
     }
+
+    // ── Incremental line scanning ─────────────────────────────────────────────
 
     // Scans for new lines added to any JSONL file since the last call.
     pub fn poll(self: *Watcher) !NewData {

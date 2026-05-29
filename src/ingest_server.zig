@@ -1,6 +1,7 @@
 // Minimal HTTP/1.1 server for the Pi.
 // Accepts POST /ingest from ctm-agent and GET /health from anyone on the LAN.
 // No TLS — assumes a trusted LAN. A shared secret prevents rogue pushes.
+// Per-source-IP rate limiting (configurable, default 120 req/min) protects the Pi Zero.
 
 const std = @import("std");
 const IngestState = @import("ingest_state.zig").IngestState;
@@ -8,14 +9,33 @@ const IngestState = @import("ingest_state.zig").IngestState;
 const MAX_HEADERS_BYTES = 8 * 1024;
 const MAX_BODY_BYTES = 512 * 1024;
 
+// Per-IP request tracking for rate limiting.
+const IpState = struct {
+    window_start_s: i64,
+    count: u32,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     state: *IngestState,
     shared_secret: []const u8,
     start_time_s: i64 = 0,
+    rate_limit_per_minute: u32 = 120,
+
+    // Rate-limit table — keyed by source-IP string, keys are heap-allocated.
+    ip_rate: std.StringHashMap(IpState) = undefined,
+    ip_rate_mutex: std.Thread.Mutex = .{},
+    request_count: u64 = 0,
 
     pub fn run(self: *Server, bind_host: []const u8, bind_port: u16) !void {
         self.start_time_s = std.time.timestamp();
+        self.ip_rate = std.StringHashMap(IpState).init(self.allocator);
+        defer {
+            var it = self.ip_rate.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.ip_rate.deinit();
+        }
+
         const address = try std.net.Address.parseIp(bind_host, bind_port);
         var net_server = try address.listen(.{ .reuse_address = true });
         defer net_server.deinit();
@@ -61,6 +81,14 @@ pub const Server = struct {
             return self.respond(stream, 404, "Not Found");
         }
 
+        // Rate-limit /ingest per source IP.
+        var ip_buf: [64]u8 = undefined;
+        const ip = remoteIp(conn.address, &ip_buf);
+        if (!self.checkRateLimit(ip)) {
+            std.log.warn("rate limit exceeded for {s}", .{ip});
+            return self.respondWithHeader(stream, 429, "Too Many Requests", "Retry-After: 60");
+        }
+
         return self.handleIngest(a, stream, header_section[first_crlf + 2 ..]);
     }
 
@@ -95,9 +123,7 @@ pub const Server = struct {
             return self.respond(stream, 400, "Content-Length required");
 
         const expected = try std.fmt.allocPrint(a, "bearer {s}", .{self.shared_secret});
-        if (self.shared_secret.len > 0 and
-            !std.ascii.eqlIgnoreCase(auth, expected))
-        {
+        if (self.shared_secret.len > 0 and !std.ascii.eqlIgnoreCase(auth, expected)) {
             return self.respond(stream, 403, "Forbidden");
         }
 
@@ -118,10 +144,12 @@ pub const Server = struct {
         const added = try self.state.addLines(parsed.value.lines);
         std.log.info("ingest: +{d} entries ({d} pushed)", .{ added, parsed.value.lines.len });
 
-        // Prune old entries. Use PRUNE_CUTOFF_SECONDS from daemon.zig (6h10m),
-        // keeping a little slack for delayed pushes from the spool.
         const cutoff = std.time.timestamp() - (6 * 60 * 60 + 10 * 60);
         self.state.pruneOlderThan(cutoff);
+
+        // Periodically evict stale entries from the rate-limit table.
+        self.request_count += 1;
+        if (self.request_count % 200 == 0) self.pruneIpTable();
 
         const resp_body = try std.fmt.allocPrint(a, "{{\"ok\":true,\"accepted\":{d}}}", .{added});
         const resp = try std.fmt.allocPrint(a,
@@ -129,6 +157,50 @@ pub const Server = struct {
             .{ resp_body.len, resp_body },
         );
         stream.writeAll(resp) catch {};
+    }
+
+    // Returns true if the request is within the rate limit for this IP.
+    fn checkRateLimit(self: *Server, ip: []const u8) bool {
+        if (self.rate_limit_per_minute == 0) return true;
+        self.ip_rate_mutex.lock();
+        defer self.ip_rate_mutex.unlock();
+
+        const now = std.time.timestamp();
+
+        if (self.ip_rate.getPtr(ip)) |s| {
+            if (now - s.window_start_s >= 60) {
+                s.* = .{ .window_start_s = now, .count = 1 };
+                return true;
+            }
+            if (s.count >= self.rate_limit_per_minute) return false;
+            s.count += 1;
+            return true;
+        }
+
+        // New IP — allocate a key copy and insert.
+        const key = self.allocator.dupe(u8, ip) catch return true;
+        self.ip_rate.put(key, .{ .window_start_s = now, .count = 1 }) catch {
+            self.allocator.free(key);
+        };
+        return true;
+    }
+
+    // Removes entries whose 1-minute window has fully expired.
+    fn pruneIpTable(self: *Server) void {
+        self.ip_rate_mutex.lock();
+        defer self.ip_rate_mutex.unlock();
+
+        const cutoff = std.time.timestamp() - 60;
+        var to_delete = std.BoundedArray([]const u8, 64).init(0) catch return;
+        var it = self.ip_rate.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.window_start_s < cutoff)
+                to_delete.append(entry.key_ptr.*) catch {};
+        }
+        for (to_delete.constSlice()) |k| {
+            _ = self.ip_rate.remove(k);
+            self.allocator.free(k);
+        }
     }
 
     fn respond(self: *Server, stream: std.net.Stream, code: u16, reason: []const u8) void {
@@ -140,7 +212,30 @@ pub const Server = struct {
         ) catch return;
         stream.writeAll(msg) catch {};
     }
+
+    fn respondWithHeader(
+        self: *Server,
+        stream: std.net.Stream,
+        code: u16,
+        reason: []const u8,
+        extra_header: []const u8,
+    ) void {
+        _ = self;
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf,
+            "HTTP/1.1 {d} {s}\r\n{s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ code, reason, extra_header },
+        ) catch return;
+        stream.writeAll(msg) catch {};
+    }
 };
+
+// Extract just the IP portion from a std.net.Address (strips the port).
+fn remoteIp(addr: std.net.Address, buf: []u8) []const u8 {
+    const full = std.fmt.bufPrint(buf, "{}", .{addr}) catch return "";
+    if (std.mem.lastIndexOfScalar(u8, full, ':')) |colon| return full[0..colon];
+    return full;
+}
 
 fn readUntilDoubleNewline(stream: std.net.Stream, buf: []u8) !usize {
     var total: usize = 0;

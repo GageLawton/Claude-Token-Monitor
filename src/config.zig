@@ -39,11 +39,23 @@ pub const EmailConfig = struct {
     to: []const u8 = "",
 };
 
+// Webhook / ntfy.sh push notification channel.
+// Works with ntfy.sh (no account needed for public topics), Slack, Discord, etc.
+pub const WebhookConfig = struct {
+    enabled: bool = false,
+    url: []const u8 = "",
+    method: []const u8 = "POST",
+    // Header name for the notification title. "X-Title" is the ntfy.sh convention.
+    title_header: []const u8 = "X-Title",
+};
+
 pub const IngestServerConfig = struct {
     enabled: bool = false,
     bind_host: []const u8 = "0.0.0.0",
     bind_port: u16 = 7373,
     shared_secret: []const u8 = "",
+    // Per-source-IP request limit per minute for /ingest. 0 disables limiting.
+    rate_limit_per_minute: u32 = 120,
 };
 
 pub const AgentConfig = struct {
@@ -109,9 +121,13 @@ pub const Config = struct {
     notify_on_reset: bool = true,
     notify_threshold_percent: u8 = 80,
     email: EmailConfig = .{},
+    webhook: WebhookConfig = .{},
     ingest_server: IngestServerConfig = .{},
     claude_data_path: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
+    // Log rotation: cap at log_max_size_mb, keep log_keep_files old files.
+    log_max_size_mb: u32 = 10,
+    log_keep_files: u8 = 3,
     state_file: ?[]const u8 = null,
 
     // Arena owning every string field allocated by load(). null for default().
@@ -169,6 +185,12 @@ pub const Config = struct {
         if (obj.get("log_file")) |v| {
             if (v == .string) cfg.log_file = try a.dupe(u8, v.string);
         }
+        if (obj.get("log_max_size_mb")) |v| {
+            if (v == .integer and v.integer > 0) cfg.log_max_size_mb = @intCast(v.integer);
+        }
+        if (obj.get("log_keep_files")) |v| {
+            if (v == .integer and v.integer >= 0) cfg.log_keep_files = @intCast(v.integer);
+        }
         if (obj.get("state_file")) |v| {
             if (v == .string) cfg.state_file = try a.dupe(u8, v.string);
         }
@@ -188,6 +210,9 @@ pub const Config = struct {
                 if (io.get("shared_secret")) |v| if (v == .string) {
                     isc.shared_secret = try a.dupe(u8, v.string);
                 };
+                if (io.get("rate_limit_per_minute")) |v| if (v == .integer) {
+                    isc.rate_limit_per_minute = @intCast(v.integer);
+                };
                 cfg.ingest_server = isc;
             }
         }
@@ -195,28 +220,25 @@ pub const Config = struct {
             if (email_val == .object) {
                 const em = email_val.object;
                 var email = EmailConfig{};
-                if (em.get("enabled")) |v| {
-                    if (v == .bool) email.enabled = v.bool;
-                }
-                if (em.get("smtp_host")) |v| {
-                    if (v == .string) email.smtp_host = try a.dupe(u8, v.string);
-                }
-                if (em.get("smtp_port")) |v| {
-                    if (v == .integer) email.smtp_port = @intCast(v.integer);
-                }
-                if (em.get("username")) |v| {
-                    if (v == .string) email.username = try a.dupe(u8, v.string);
-                }
-                if (em.get("password")) |v| {
-                    if (v == .string) email.password = try a.dupe(u8, v.string);
-                }
-                if (em.get("from")) |v| {
-                    if (v == .string) email.from = try a.dupe(u8, v.string);
-                }
-                if (em.get("to")) |v| {
-                    if (v == .string) email.to = try a.dupe(u8, v.string);
-                }
+                if (em.get("enabled")) |v| if (v == .bool) { email.enabled = v.bool; };
+                if (em.get("smtp_host")) |v| if (v == .string) { email.smtp_host = try a.dupe(u8, v.string); };
+                if (em.get("smtp_port")) |v| if (v == .integer) { email.smtp_port = @intCast(v.integer); };
+                if (em.get("username")) |v| if (v == .string) { email.username = try a.dupe(u8, v.string); };
+                if (em.get("password")) |v| if (v == .string) { email.password = try a.dupe(u8, v.string); };
+                if (em.get("from")) |v| if (v == .string) { email.from = try a.dupe(u8, v.string); };
+                if (em.get("to")) |v| if (v == .string) { email.to = try a.dupe(u8, v.string); };
                 cfg.email = email;
+            }
+        }
+        if (obj.get("webhook")) |wh_val| {
+            if (wh_val == .object) {
+                const wh = wh_val.object;
+                var webhook = WebhookConfig{};
+                if (wh.get("enabled")) |v| if (v == .bool) { webhook.enabled = v.bool; };
+                if (wh.get("url")) |v| if (v == .string) { webhook.url = try a.dupe(u8, v.string); };
+                if (wh.get("method")) |v| if (v == .string) { webhook.method = try a.dupe(u8, v.string); };
+                if (wh.get("title_header")) |v| if (v == .string) { webhook.title_header = try a.dupe(u8, v.string); };
+                cfg.webhook = webhook;
             }
         }
 

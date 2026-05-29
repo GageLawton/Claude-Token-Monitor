@@ -10,10 +10,15 @@
     "enabled": true,
     "bind_host": "0.0.0.0",
     "bind_port": 7373,
-    "shared_secret": "change-me-to-something-random"
+    "shared_secret": "run-ctm-gen-secret-to-generate-this",
+    "rate_limit_per_minute": 120
   },
 
   "log_file": "/home/pi/.ctm.log",
+  "log_max_size_mb": 10,
+  "log_keep_files": 3,
+
+  "state_file": "/home/pi/.cache/ctm/state.jsonl",
 
   "email": {
     "enabled": true,
@@ -23,5 +28,13 @@
     "password": "your-gmail-app-password",
     "from": "you@gmail.com",
     "to": "notify@youremail.com"
+  },
+
+  "_comment2": "Optional: ntfy.sh push notifications (no account needed for public topics)",
+  "webhook": {
+    "enabled": false,
+    "url": "https://ntfy.sh/my-ctm-alerts",
+    "method": "POST",
+    "title_header": "X-Title"
   }
 }
